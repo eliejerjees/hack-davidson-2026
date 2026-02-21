@@ -2,7 +2,7 @@ from __future__ import annotations
 
 
 def execute_tool_calls(tool_calls: list[dict], ctx: dict) -> None:
-    # Person A will implement REAPER execution details here.
+    # Dev harness only. Real execution happens in cursor.lua after Apply confirmation.
     selected_items = (ctx or {}).get("selected_items") or []
     selected_tracks = (ctx or {}).get("selected_tracks") or []
     time_selection = (ctx or {}).get("time_selection")
@@ -17,8 +17,5 @@ def execute_tool_calls(tool_calls: list[dict], ctx: dict) -> None:
     for call in tool_calls:
         name = call.get("name")
         args = call.get("args", {})
-        if args:
-            arg_text = ", ".join(f"{k}={v}" for k, v in args.items())
-        else:
-            arg_text = ""
+        arg_text = ", ".join(f"{k}={v}" for k, v in args.items()) if args else ""
         print(f"EXECUTE {name}({arg_text})")

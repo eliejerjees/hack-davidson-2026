@@ -1,151 +1,174 @@
 from __future__ import annotations
 
+import sys
+from typing import Any
 
-ITEM_TOOLS = {
-    "fade_in",
-    "fade_out",
-    "cut_middle",
-    "trim_to_time_selection",
-    "split_at_cursor",
-    "crossfade",
-}
-
-TRACK_TOOLS = {
-    "set_volume_delta",
-    "set_pan",
-    "mute",
-    "unmute",
-    "solo",
-    "unsolo",
-    "add_fx",
-}
+if sys.version_info >= (3, 10):
+    from typing import TypeGuard
+else:
+    from typing_extensions import TypeGuard
 
 
-def _fmt_duration(seconds: float) -> str:
-    return f"{float(seconds):.1f}s"
+def _is_number(value: Any) -> TypeGuard[int | float]:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
-def _fmt_range(seconds: float) -> str:
-    m = int(seconds // 60)
-    s = float(seconds) - (60 * m)
-    return f"{m:02d}:{s:06.3f}"
+def _as_float(value: Any, fallback: float = 0.0) -> float:
+    if _is_number(value):
+        return float(value)
+    return fallback
 
 
-def _selected_items(ctx: dict) -> list[dict]:
-    items = (ctx or {}).get("selected_items")
-    return items if isinstance(items, list) else []
+def _as_int(value: Any, fallback: int = 0) -> int:
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if _is_number(value):
+        return int(value)
+    return fallback
 
 
-def _selected_tracks(ctx: dict) -> list[dict]:
-    tracks = (ctx or {}).get("selected_tracks")
-    return tracks if isinstance(tracks, list) else []
+def _fmt_time(seconds: float) -> str:
+    minutes = int(seconds // 60)
+    secs = float(seconds) - (60 * minutes)
+    return f"{minutes:02d}:{secs:06.3f}"
 
 
-def _time_selection(ctx: dict) -> dict | None:
-    ts = (ctx or {}).get("time_selection")
-    return ts if isinstance(ts, dict) else None
+def _selected_clips(ctx: dict[str, Any]) -> list[dict[str, Any]]:
+    selected_items = ctx.get("selected_items")
+    return selected_items if isinstance(selected_items, list) else []
 
 
-def build_preview(tool_calls: list[dict], ctx: dict) -> dict:
-    bullets = []
-    item_calls = False
-    track_calls = False
-    time_selection_calls = False
+def _selected_tracks(ctx: dict[str, Any]) -> list[dict[str, Any]]:
+    selected_tracks = ctx.get("selected_tracks")
+    return selected_tracks if isinstance(selected_tracks, list) else []
 
-    selected_items = _selected_items(ctx)
-    selected_tracks = _selected_tracks(ctx)
-    ts = _time_selection(ctx)
 
-    has_items = len(selected_items) > 0
-    has_tracks = len(selected_tracks) > 0
-    has_time_selection = bool(ts and "start" in ts and "end" in ts)
+def _volume_delta_line(args: dict[str, Any]) -> str:
+    if "db" in args:
+        db = _as_float(args.get("db"))
+        direction = "Raise" if db > 0 else "Lower"
+        return f"{direction} track volume by {abs(db):.1f} dB"
 
-    for call in tool_calls:
-        name = call.get("name")
-        args = call.get("args", {})
+    percent = _as_float(args.get("percent"))
+    direction = "Raise" if percent > 0 else "Lower"
+    multiplier = 1.0 + (percent / 100.0)
+    return f"{direction} track volume by {abs(percent):.1f}% (gain x {multiplier:.2f})"
 
-        if name in ITEM_TOOLS:
-            item_calls = True
-        if name in TRACK_TOOLS:
-            track_calls = True
 
-        if name == "fade_in":
-            target = "selected item(s)" if has_items else "time selection"
-            bullets.append(f"Fade in {target} by {_fmt_duration(args['seconds'])}")
-            if not has_items and has_time_selection:
-                time_selection_calls = True
-        elif name == "fade_out":
-            target = "selected item(s)" if has_items else "time selection"
-            bullets.append(f"Fade out {target} by {_fmt_duration(args['seconds'])}")
-            if not has_items and has_time_selection:
-                time_selection_calls = True
-        elif name == "cut_middle":
-            target = "selected item(s)" if has_items else "time selection"
-            bullets.append(f"Cut {_fmt_duration(args['seconds'])} from middle of {target}")
-            if not has_items and has_time_selection:
-                time_selection_calls = True
-        elif name == "trim_to_time_selection":
-            bullets.append("Trim selected item(s) to current time selection")
-            time_selection_calls = True
-        elif name == "split_at_cursor":
-            target = "selected item(s)" if has_items else "time selection"
-            bullets.append(f"Split {target} at cursor")
-            if not has_items and has_time_selection:
-                time_selection_calls = True
-        elif name == "duplicate":
-            if has_items and not has_tracks:
-                item_calls = True
-                bullets.append(f"Duplicate selected item(s) by {args['count']} time(s)")
-            elif has_tracks and not has_items:
-                track_calls = True
-                bullets.append(f"Duplicate selected track(s) by {args['count']} time(s)")
-            else:
-                bullets.append(f"Duplicate target by {args['count']} time(s)")
-        elif name == "set_volume_delta":
-            bullets.append(f"Adjust selected track volume by {float(args['db']):+.1f} dB")
-        elif name == "set_pan":
-            pan = float(args["pan"])
-            if pan < 0:
-                bullets.append(f"Set selected track pan to {abs(pan):.1f} left")
-            elif pan > 0:
-                bullets.append(f"Set selected track pan to {pan:.1f} right")
-            else:
-                bullets.append("Set selected track pan to center")
-        elif name == "mute":
-            bullets.append("Mute selected track(s)")
-        elif name == "unmute":
-            bullets.append("Unmute selected track(s)")
-        elif name == "solo":
-            bullets.append("Solo selected track(s)")
-        elif name == "unsolo":
-            bullets.append("Unsolo selected track(s)")
-        elif name == "add_fx":
-            bullets.append(f"Add {args['type']} FX to selected track(s)")
-        elif name == "crossfade":
-            bullets.append(f"Crossfade selected items by {_fmt_duration(args['seconds'])}")
+def _render_tool_line(tool_call: dict[str, Any], clip_count: int, track_count: int) -> str:
+    name = tool_call.get("name")
+    args_raw = tool_call.get("args")
+    args = args_raw if isinstance(args_raw, dict) else {}
 
-    if item_calls:
-        if has_items:
-            bullets.append(f"Applied to {len(selected_items)} item(s)")
-        elif has_time_selection:
-            bullets.append("Applied to time selection")
-        else:
-            bullets.append("Applied to selected item(s)")
+    if name == "fade_out":
+        return f"Fade out by {_as_float(args.get('seconds')):.1f}s"
+    if name == "fade_in":
+        return f"Fade in by {_as_float(args.get('seconds')):.1f}s"
+    if name == "set_volume_delta":
+        return _volume_delta_line(args)
+    if name == "set_volume_set":
+        percent = _as_float(args.get("percent"))
+        return f"Set track volume to {percent:.1f}% (gain = {percent / 100.0:.2f})"
+    if name == "set_pan":
+        pan = _as_int(args.get("pan"))
+        if pan == 0:
+            return "Set pan to center"
+        direction = "left" if pan < 0 else "right"
+        return f"Set pan to {abs(pan)} {direction}"
+    if name == "add_fx":
+        fx_type = args.get("type")
+        return f"Add {fx_type} FX"
+    if name == "mute":
+        return "Mute selected track(s)"
+    if name == "unmute":
+        return "Unmute selected track(s)"
+    if name == "solo":
+        return "Solo selected track(s)"
+    if name == "unsolo":
+        return "Unsolo selected track(s)"
+    if name == "crossfade":
+        return f"Crossfade {clip_count} selected clips over {_as_float(args.get('seconds')):.1f}s"
+    if name == "cut_middle":
+        return f"Remove {_as_float(args.get('seconds')):.1f}s from middle of selected clip(s)"
+    if name == "split_at_cursor":
+        return "Split selected clip(s) at cursor"
+    if name == "duplicate":
+        count = _as_int(args.get("count"))
+        if clip_count > 0:
+            return f"Duplicate selected clip(s) {count} times"
+        if track_count > 0:
+            return f"Duplicate selected track(s) {count} times"
+        return f"Duplicate selection {count} times"
+    if name == "trim_to_time_selection":
+        return "Trim selected clip(s) to time selection"
 
-        starts = [float(i["start"]) for i in selected_items if isinstance(i, dict) and "start" in i and "end" in i]
-        ends = [float(i["end"]) for i in selected_items if isinstance(i, dict) and "start" in i and "end" in i]
+    return f"{name} {args}"
+
+
+def build_preview(tool_calls: list[dict[str, Any]], ctx: dict[str, Any]) -> dict[str, Any]:
+    clips = _selected_clips(ctx)
+    tracks = _selected_tracks(ctx)
+    clip_count = len(clips)
+    track_count = len(tracks)
+
+    bullets: list[str] = []
+    uses_clips = False
+    uses_tracks = False
+    uses_time_selection = False
+
+    for tool_call in tool_calls:
+        name = tool_call.get("name")
+        bullets.append(_render_tool_line(tool_call, clip_count, track_count))
+
+        if name in {"fade_in", "fade_out", "crossfade", "cut_middle", "split_at_cursor", "trim_to_time_selection"}:
+            uses_clips = True
+        if name in {"set_volume_delta", "set_volume_set", "set_pan", "add_fx", "mute", "unmute", "solo", "unsolo"}:
+            uses_tracks = True
+        if name in {"split_at_cursor", "trim_to_time_selection"}:
+            uses_time_selection = True
+        if name == "duplicate":
+            if clip_count > 0:
+                uses_clips = True
+            elif track_count > 0:
+                uses_tracks = True
+
+    if uses_clips:
+        if clip_count == 1:
+            bullets.append("Applied to 1 selected clip")
+        elif clip_count > 1:
+            bullets.append(f"Applied to {clip_count} selected clips")
+
+        starts: list[float] = []
+        ends: list[float] = []
+        for clip in clips:
+            if not isinstance(clip, dict):
+                continue
+            start = _as_float(clip.get("start"), fallback=-1.0)
+            end = _as_float(clip.get("end"), fallback=-1.0)
+            if start >= 0 and end >= 0:
+                starts.append(start)
+                ends.append(end)
         if starts and ends:
-            bullets.append(f"Range: {_fmt_range(min(starts))} -> {_fmt_range(max(ends))}")
-        elif has_time_selection and ts:
-            bullets.append(f"Range: {_fmt_range(float(ts['start']))} -> {_fmt_range(float(ts['end']))}")
+            bullets.append(f"Range: {_fmt_time(min(starts))} -> {_fmt_time(max(ends))}")
 
-    if track_calls:
-        if has_tracks:
-            bullets.append(f"Applied to {len(selected_tracks)} track(s)")
-        else:
-            bullets.append("Applied to selected track(s)")
+    if uses_tracks:
+        if track_count == 1:
+            bullets.append("Applied to 1 selected track")
+        elif track_count > 1:
+            bullets.append(f"Applied to {track_count} selected tracks")
 
-    if time_selection_calls and has_time_selection and ts and not (item_calls and not has_items):
-        bullets.append(f"Time selection: {_fmt_range(float(ts['start']))} -> {_fmt_range(float(ts['end']))}")
+    time_selection = ctx.get("time_selection")
+    if uses_time_selection and isinstance(time_selection, dict):
+        start = _as_float(time_selection.get("start"), fallback=-1.0)
+        end = _as_float(time_selection.get("end"), fallback=-1.0)
+        if end > start:
+            bullets.append(f"Time selection: {_fmt_time(start)} -> {_fmt_time(end)}")
 
-    return {"title": "Preview:", "bullets": bullets, "summary": f"{len(tool_calls)} tool call(s)"}
+    return {"title": "Preview:", "bullets": bullets}
+
+
+def render_preview_text(tool_calls: list[dict[str, Any]], ctx: dict[str, Any]) -> str:
+    preview = build_preview(tool_calls, ctx)
+    lines = [preview["title"]]
+    lines.extend(f"- {bullet}" for bullet in preview["bullets"])
+    return "\n".join(lines)

@@ -1,13 +1,18 @@
-
-# Minimal ignores for this repo
-
-# Python bytecode cache
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
 
-# Local environment file (keep `.env.example` tracked)
+# Virtual envs
+.venv/
+venv/
+
+# Local secrets/config
 .env
 
-# macOS Finder metadata
-.DS_Store
+# REAPER bridge temp files
+cursor_input_*.json
+cursor_output_*.json
+cursor_*.json
 
+# macOS
+.DS_Store

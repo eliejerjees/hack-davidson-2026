@@ -1,29 +1,38 @@
 from __future__ import annotations
 
+from typing import Any
+
+from reaper_py.bridge import process_payload
 from reaper_py.contract import execute_tool_calls
-from reaper_py.gemini_agent import GeminiAgentError, GeminiNotConfiguredError, plan_tool_calls
 from reaper_py.history import CommandHistory
-from reaper_py.preview import build_preview
-from reaper_py.validate import validate_tool_plan
 
 
-hist = CommandHistory()
+history = CommandHistory()
 
 
-def mock_ctx_items() -> dict:
+def mock_ctx_none() -> dict[str, Any]:
     return {
-        "selected_items": [{"id": "item-1", "start": 42.1, "end": 45.1}],
+        "selected_items": [],
         "selected_tracks": [],
         "time_selection": None,
         "cursor": 43.0,
     }
 
 
-def mock_ctx_items2() -> dict:
+def mock_ctx_clip() -> dict[str, Any]:
+    return {
+        "selected_items": [{"start": 42.1, "end": 45.1, "length": 3.0}],
+        "selected_tracks": [],
+        "time_selection": None,
+        "cursor": 43.0,
+    }
+
+
+def mock_ctx_two_clips() -> dict[str, Any]:
     return {
         "selected_items": [
-            {"id": "item-1", "start": 42.1, "end": 44.2},
-            {"id": "item-2", "start": 44.0, "end": 46.5},
+            {"start": 42.1, "end": 44.1, "length": 2.0},
+            {"start": 44.2, "end": 46.2, "length": 2.0},
         ],
         "selected_tracks": [],
         "time_selection": None,
@@ -31,131 +40,126 @@ def mock_ctx_items2() -> dict:
     }
 
 
-def mock_ctx_tracks() -> dict:
+def mock_ctx_track() -> dict[str, Any]:
     return {
         "selected_items": [],
-        "selected_tracks": [{"id": "track-1", "name": "Lead Vox"}],
+        "selected_tracks": [{"name": "Track 1", "index": 1}],
         "time_selection": None,
         "cursor": 43.0,
     }
 
 
-def mock_ctx_time() -> dict:
+def mock_ctx_time() -> dict[str, Any]:
     return {
         "selected_items": [],
         "selected_tracks": [],
-        "time_selection": {"start": 42.1, "end": 44.1},
+        "time_selection": {"start": 42.0, "end": 46.0},
         "cursor": 43.0,
     }
 
 
-def mock_ctx_none() -> dict:
-    return {"selected_items": [], "selected_tracks": [], "time_selection": None, "cursor": 43.0}
+def _show_ctx(ctx: dict[str, Any]) -> str:
+    return (
+        f"clips={len(ctx.get('selected_items') or [])}, "
+        f"tracks={len(ctx.get('selected_tracks') or [])}, "
+        f"time_selection={'yes' if ctx.get('time_selection') else 'no'}"
+    )
 
 
-CONTEXT_PRESETS = {
-    "items": mock_ctx_items,
-    "items2": mock_ctx_items2,
-    "tracks": mock_ctx_tracks,
-    "time": mock_ctx_time,
-    "none": mock_ctx_none,
-}
+def _context_hint(answer: str, ctx: dict[str, Any]) -> str | None:
+    if answer == "tracks" and not (ctx.get("selected_tracks") or []):
+        return "No tracks in this mock context. Use 'select a track' to simulate selection."
+    if answer == "clips" and not (ctx.get("selected_items") or []):
+        return "No clips in this mock context. Use 'select a clip' to simulate selection."
+    return None
 
 
-def _fmt_time(value: float) -> str:
-    m = int(value // 60)
-    s = float(value) - (60 * m)
-    return f"{m:02d}:{s:06.3f}"
+def _set_context_from_command(command: str) -> dict[str, Any] | None:
+    normalized = " ".join(command.strip().lower().split())
+    if normalized == "select a track":
+        return mock_ctx_track()
+    if normalized == "select a clip":
+        return mock_ctx_clip()
+    if normalized == "select two clips":
+        return mock_ctx_two_clips()
+    if normalized == "select a time range":
+        return mock_ctx_time()
+    if normalized == "clear selection":
+        return mock_ctx_none()
+    return None
 
 
-def ctx_summary(ctx: dict) -> str:
-    item_count = len((ctx or {}).get("selected_items") or [])
-    track_count = len((ctx or {}).get("selected_tracks") or [])
-    ts = (ctx or {}).get("time_selection")
-    cursor = float((ctx or {}).get("cursor", 0.0))
-    time_text = "none"
-    if isinstance(ts, dict) and "start" in ts and "end" in ts:
-        time_text = f"{_fmt_time(float(ts['start']))} -> {_fmt_time(float(ts['end']))}"
-    return f"items={item_count}, tracks={track_count}, time_selection={time_text}, cursor={_fmt_time(cursor)}"
+def main() -> None:
+    print("Cursor for DAWs dev harness")
+    print("Type natural-language commands, or q to quit.")
+    print("Mock selection commands:")
+    print("- select a track")
+    print("- select a clip")
+    print("- select two clips")
+    print("- select a time range")
+    print("- clear selection")
 
-
-def handle_ctx_command(raw: str, current_ctx: dict) -> dict:
-    parts = raw.split()
-    if len(parts) == 1 or (len(parts) == 2 and parts[1] == "show"):
-        print("Context presets: items, items2, tracks, time, none")
-        print("Current:", ctx_summary(current_ctx))
-        return current_ctx
-
-    if len(parts) != 2:
-        print("Usage: :ctx <items|items2|tracks|time|none>")
-        return current_ctx
-
-    preset = parts[1].lower()
-    builder = CONTEXT_PRESETS.get(preset)
-    if not builder:
-        print(f"Unknown context preset: {preset}")
-        print("Available: items, items2, tracks, time, none")
-        return current_ctx
-
-    new_ctx = builder()
-    print(f"Switched context -> {preset}: {ctx_summary(new_ctx)}")
-    return new_ctx
-
-
-def main():
-    print("Gemini-first REAPER agent (MVP)")
-    print("Type commands. q to quit.")
-    print("Use :ctx <items|items2|tracks|time|none> to switch mock REAPER context.")
-
-    ctx = mock_ctx_items()
-    print("Current:", ctx_summary(ctx))
+    ctx = mock_ctx_none()
+    print(f"Current context: {_show_ctx(ctx)}")
 
     while True:
-        cmd = input("> ").strip()
-        if cmd in ("q", "quit", "exit"):
+        command = input("> ").strip()
+        if command in {"q", "quit", "exit"}:
             break
-
-        if not cmd:
+        if not command:
             continue
 
-        if cmd.startswith(":ctx"):
-            ctx = handle_ctx_command(cmd, ctx)
+        next_ctx = _set_context_from_command(command)
+        if next_ctx is not None:
+            ctx = next_ctx
+            print(f"Context updated -> {_show_ctx(ctx)}")
             continue
 
-        try:
-            plan = plan_tool_calls(cmd, ctx)
-        except GeminiNotConfiguredError as exc:
-            print(exc)
-            continue
-        except GeminiAgentError as exc:
-            print(f"Gemini planning error: {exc}")
+        response = process_payload({"cmd": command, "ctx": ctx})
+        history.add(command, response.get("tool_calls") or [])
+
+        if not response.get("ok"):
+            print(response.get("error") or "Unknown error.")
             continue
 
-        if plan["needs_clarification"]:
-            print(plan["clarification_question"])
-            hist.add(cmd, tool_calls=[])
-            continue
+        if response.get("needs_clarification"):
+            question = response.get("clarification_question") or "Do you mean clips or tracks?"
+            print(question)
+            answer = input("Answer (clips/tracks): ").strip().lower()
+            if answer not in {"clips", "clip", "tracks", "track"}:
+                print("Clarification skipped. Please answer with clips or tracks.")
+                continue
 
-        hist.add(cmd, tool_calls=plan["tool_calls"])
+            forced_target = "tracks" if answer.startswith("track") else "clips"
+            follow_up = process_payload(
+                {
+                    "cmd": command,
+                    "ctx": ctx,
+                    "forced_target": forced_target,
+                    "clarification_answer": forced_target,
+                }
+            )
 
-        ok, error = validate_tool_plan(plan, ctx)
-        if not ok:
-            print(f"Validation error: {error}")
-            print("No changes were prepared.")
-            continue
+            if not follow_up.get("ok"):
+                print(follow_up.get("error") or "Could not resolve clarification.")
+                hint = _context_hint(forced_target, ctx)
+                if hint:
+                    print(hint)
+                continue
 
-        tool_calls = plan["tool_calls"]
-        preview = build_preview(tool_calls, ctx)
-        print(preview["title"])
-        for bullet in preview["bullets"]:
-            print("✓", bullet)
+            if follow_up.get("needs_clarification"):
+                print("Still ambiguous after one clarification. Try a more specific command.")
+                continue
 
+            response = follow_up
+
+        print(response.get("preview") or "")
         apply_now = input("Apply? (y/n) ").strip().lower()
-        if apply_now not in ("y", "yes"):
+        if apply_now not in {"y", "yes"}:
             print("Canceled.")
             continue
 
-        execute_tool_calls(tool_calls, ctx)
+        execute_tool_calls(response.get("tool_calls") or [], ctx)
 
 
 if __name__ == "__main__":
