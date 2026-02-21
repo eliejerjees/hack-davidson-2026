@@ -17,14 +17,23 @@ local imgui_ctx = reaper.ImGui_CreateContext(WINDOW_TITLE)
 
 local history = {}
 local command_input = ""
-local pending_cmd = nil
 local pending_plan = nil
 local pending_question = nil
+local pending_intent = nil
+local last_user_intent = nil
 local forced_target = nil
 local clarification_attempted = false
 local last_preview = "No preview yet."
 local last_error = nil
+local status_line = "Ready"
+local is_planning = false
+local quick_apply = true
+local show_preview = false
+local verbose_history = false
 local scroll_history_to_bottom = false
+
+local mono_font = nil
+-- Disabled by default for wide ReaImGui compatibility across versions.
 
 
 local function clamp(value, min_value, max_value)
@@ -54,21 +63,60 @@ local function normalize_text(text)
     return value
 end
 
-local function append_history(role, text)
+local function trim(text)
+    return tostring(text or ""):match("^%s*(.-)%s*$")
+end
+
+local function append_history(role, text, always)
+    if role ~= "user" and not always and not verbose_history then
+        return
+    end
     history[#history + 1] = {role = role, text = normalize_text(text)}
     scroll_history_to_bottom = true
+end
+
+local function set_status(text)
+    status_line = tostring(text or "Ready")
+end
+
+local function push_mono_font_if_available()
+    -- Keep preview rendering stable across ReaImGui bindings.
+    -- If needed later, this can be re-enabled behind a verified version check.
+    return false
+end
+
+local function pop_mono_font_if_pushed(pushed)
+    if pushed and reaper.ImGui_PopFont then
+        pcall(reaper.ImGui_PopFont, imgui_ctx)
+    end
+end
+
+local function checkbox_compat(label, current_value)
+    local ok, changed_or_value, maybe_value = pcall(reaper.ImGui_Checkbox, imgui_ctx, label, current_value)
+    if not ok then
+        return false, current_value
+    end
+    if type(maybe_value) == "boolean" then
+        return changed_or_value, maybe_value
+    end
+    if type(changed_or_value) == "boolean" then
+        return changed_or_value ~= current_value, changed_or_value
+    end
+    return false, current_value
 end
 
 local function clear_state()
     history = {}
     command_input = ""
-    pending_cmd = nil
     pending_plan = nil
     pending_question = nil
+    pending_intent = nil
+    last_user_intent = nil
     forced_target = nil
     clarification_attempted = false
     last_preview = "No preview yet."
     last_error = nil
+    set_status("Ready")
 end
 
 local function begin_child_compat(id, width, height, bordered)
@@ -911,101 +959,440 @@ local function clear_pending_plan_state()
     clarification_attempted = false
 end
 
-local function handle_preview_request(command, target)
+local function question_is_target_choice(question)
+    local lower = string.lower(tostring(question or ""))
+    local has_clip = lower:find("clip", 1, true) ~= nil
+    local has_track = lower:find("track", 1, true) ~= nil
+    return has_clip and has_track
+end
+
+local function infer_intent_from_command(command)
+    local lower = string.lower(trim(command))
+    local intent = {
+        kind = nil,
+        phrase = nil,
+        expects_number = false,
+        forced_target = nil,
+    }
+
+    if lower == "" then
+        return intent
+    end
+
+    if lower:find("volume", 1, true) or lower:find("turn it down", 1, true) or lower:find("turn down", 1, true) then
+        intent.kind = "volume"
+        intent.expects_number = true
+        if lower:find("lower", 1, true) or lower:find("down", 1, true) or lower:find("decrease", 1, true) then
+            intent.phrase = "lower volume"
+        elseif lower:find("raise", 1, true) or lower:find("increase", 1, true) or lower:find("up", 1, true) then
+            intent.phrase = "raise volume"
+        else
+            intent.phrase = "adjust volume"
+        end
+        return intent
+    end
+
+    if lower:find("fade out", 1, true) then
+        intent.kind = "fade_out"
+        intent.phrase = "fade out"
+        intent.expects_number = true
+        return intent
+    end
+    if lower:find("fade in", 1, true) then
+        intent.kind = "fade_in"
+        intent.phrase = "fade in"
+        intent.expects_number = true
+        return intent
+    end
+    if lower:find("crossfade", 1, true) then
+        intent.kind = "crossfade"
+        intent.phrase = "crossfade"
+        intent.expects_number = true
+        return intent
+    end
+    if lower:find("middle", 1, true) and lower:find("cut", 1, true) then
+        intent.kind = "cut_middle"
+        intent.phrase = "cut middle"
+        intent.expects_number = true
+        return intent
+    end
+    if lower:find("duplicate", 1, true) then
+        intent.kind = "duplicate"
+        intent.phrase = "duplicate"
+        intent.expects_number = true
+        return intent
+    end
+    if lower:find("pan", 1, true) then
+        intent.kind = "pan"
+        intent.phrase = "set pan"
+        intent.expects_number = true
+        return intent
+    end
+
+    intent.phrase = trim(command)
+    return intent
+end
+
+local function infer_intent_from_tool_calls(command, tool_calls, target)
+    local fallback = infer_intent_from_command(command)
+    local first = tool_calls and tool_calls[1] or nil
+    if type(first) ~= "table" then
+        fallback.forced_target = target
+        return fallback
+    end
+
+    local name = first.name
+    local args = type(first.args) == "table" and first.args or {}
+    local intent = {
+        kind = nil,
+        phrase = nil,
+        expects_number = false,
+        forced_target = target,
+    }
+
+    if name == "set_volume_delta" then
+        intent.kind = "volume"
+        intent.expects_number = true
+        local amount = tonumber(args.db or args.percent or 0) or 0
+        intent.phrase = amount < 0 and "lower volume" or "raise volume"
+    elseif name == "set_volume_set" then
+        intent.kind = "volume"
+        intent.phrase = "set volume to"
+        intent.expects_number = true
+    elseif name == "fade_out" then
+        intent.kind = "fade_out"
+        intent.phrase = "fade out"
+        intent.expects_number = true
+    elseif name == "fade_in" then
+        intent.kind = "fade_in"
+        intent.phrase = "fade in"
+        intent.expects_number = true
+    elseif name == "crossfade" then
+        intent.kind = "crossfade"
+        intent.phrase = "crossfade"
+        intent.expects_number = true
+    elseif name == "cut_middle" then
+        intent.kind = "cut_middle"
+        intent.phrase = "cut middle"
+        intent.expects_number = true
+    elseif name == "duplicate" then
+        intent.kind = "duplicate"
+        intent.phrase = "duplicate"
+        intent.expects_number = true
+    elseif name == "set_pan" then
+        intent.kind = "pan"
+        intent.phrase = "set pan"
+        intent.expects_number = true
+    else
+        intent = fallback
+        intent.forced_target = target
+        return intent
+    end
+
+    return intent
+end
+
+local function is_parameter_only_input(input_text, allow_plain_number)
+    local raw = trim(input_text)
+    if raw == "" then
+        return false
+    end
+
+    local lower = string.lower(raw)
+    local compact = lower:gsub("%s+", "")
+
+    if compact:match("^[%+%-]?%d+%.?%d*db$") then
+        return true
+    end
+    if compact:match("^[%+%-]?%d+%.?%d*%%$") then
+        return true
+    end
+    if lower:find("percent", 1, true) and lower:match("[%+%-]?%d+%.?%d*") then
+        return true
+    end
+
+    local time_units = {"milliseconds", "msec", "ms", "seconds", "sec", "s"}
+    for i = 1, #time_units do
+        local suffix = time_units[i]
+        if #compact > #suffix and compact:sub(-#suffix) == suffix then
+            local number_text = compact:sub(1, #compact - #suffix)
+            if tonumber(number_text) ~= nil then
+                return true
+            end
+        end
+    end
+
+    if allow_plain_number and compact:match("^[%+%-]?%d+%.?%d*$") then
+        return true
+    end
+
+    return false
+end
+
+local function build_followup_command(intent, user_value)
+    local value = trim(user_value)
+    local kind = intent and intent.kind or nil
+    local phrase = intent and intent.phrase or "adjust"
+
+    if kind == "volume" then
+        if phrase == "set volume to" then
+            return "set volume to " .. value
+        end
+        return phrase .. " by " .. value
+    end
+    if kind == "fade_out" then
+        return "fade this out by " .. value
+    end
+    if kind == "fade_in" then
+        return "fade this in by " .. value
+    end
+    if kind == "crossfade" then
+        return "crossfade these by " .. value
+    end
+    if kind == "cut_middle" then
+        return "cut " .. value .. " from the middle"
+    end
+    if kind == "duplicate" then
+        return "duplicate this " .. value .. " times"
+    end
+    if kind == "pan" then
+        return "set pan to " .. value
+    end
+    return phrase .. " " .. value
+end
+
+local function first_preview_action(preview_text)
+    local text = tostring(preview_text or "")
+    for line in text:gmatch("[^\n]+") do
+        local bullet = line:match("^%-%s*(.+)$")
+        if bullet then
+            return bullet
+        end
+    end
+    local compact = trim(text)
+    if compact == "" then
+        return "Applied edits"
+    end
+    return compact
+end
+
+local function build_conversation_hint()
+    local hint = {}
+    if last_user_intent and last_user_intent.phrase then
+        hint.last_intent = tostring(last_user_intent.phrase)
+    end
+    if pending_intent and pending_intent.original_cmd then
+        hint.pending_intent = tostring(pending_intent.original_cmd)
+    end
+    if next(hint) == nil then
+        return nil
+    end
+    return hint
+end
+
+local function execute_tool_calls_now(tool_calls)
+    if not tool_calls or #tool_calls == 0 then
+        return 0
+    end
+
+    reaper.Undo_BeginBlock()
+    for i = 1, #tool_calls do
+        dispatch_tool_call(tool_calls[i])
+    end
+    reaper.UpdateArrange()
+    reaper.Undo_EndBlock("Cursor for DAWs: AI edit", -1)
+    return #tool_calls
+end
+
+local function run_command_flow(command, target, from_followup)
+    local normalized_command = trim(command)
+    if normalized_command == "" then
+        return
+    end
+
+    is_planning = true
+    set_status("Planning...")
     last_error = nil
-    local ctx = collect_context()
 
     local payload = {
-        cmd = command,
-        ctx = ctx,
+        cmd = normalized_command,
+        ctx = collect_context(),
     }
     if target then
         payload.forced_target = target
         payload.clarification_answer = target
     end
+    local hint = build_conversation_hint()
+    if hint then
+        payload.conversation_hint = hint
+    end
 
     local response, bridge_error = run_bridge_payload(payload)
+    is_planning = false
+
     if bridge_error then
         last_error = normalize_text(bridge_error)
-        append_history("system", last_error)
+        append_history("system", "Error: " .. last_error, true)
+        set_status("Error: " .. last_error)
         clear_pending_plan_state()
+        pending_intent = nil
         return
     end
 
     if not response.ok then
         last_error = normalize_text(response.error or "Bridge returned an error.")
-        append_history("system", last_error)
+        append_history("system", "Error: " .. last_error, true)
+        set_status("Error: " .. last_error)
         clear_pending_plan_state()
+        pending_intent = nil
         return
     end
 
     if response.needs_clarification then
-        if target then
-            local target_error = target == "tracks" and "No selected tracks. Select a track in REAPER." or "No selected clips. Select a clip in REAPER."
-            last_error = target_error
-            append_history("system", target_error)
+        if target or from_followup then
+            last_error = "Could not resolve command after one follow-up. Try one complete command."
+            append_history("system", "Error: " .. last_error, true)
+            set_status("Error: " .. last_error)
             clear_pending_plan_state()
+            pending_intent = nil
             return
         end
 
-        pending_cmd = command
-        pending_question = normalize_text(response.clarification_question or "Do you mean the selected clip(s) or the selected track(s)?")
+        pending_plan = nil
+        pending_question = normalize_text(response.clarification_question or "Please clarify your command.")
         forced_target = nil
         clarification_attempted = false
-        pending_plan = nil
         last_preview = pending_question
-        append_history("system", pending_question)
+
+        local seed_intent = infer_intent_from_command(normalized_command)
+        pending_intent = {
+            original_cmd = normalized_command,
+            forced_target = nil,
+            kind = seed_intent.kind,
+            phrase = seed_intent.phrase,
+            expects_number = seed_intent.expects_number,
+            attempted = false,
+        }
+
+        append_history("system", pending_question, true)
+        set_status("Waiting for clarification")
         return
     end
 
     local tool_calls = response.tool_calls or {}
-    pending_plan = {
-        tool_calls = tool_calls,
-        preview = normalize_text(response.preview or "No preview generated."),
-    }
+    local preview_text = normalize_text(response.preview or "No preview generated.")
     pending_question = nil
+    pending_intent = nil
     forced_target = nil
     clarification_attempted = false
-    last_preview = pending_plan.preview
-    append_history("system", last_preview)
+    last_preview = preview_text
+    last_error = nil
+    last_user_intent = infer_intent_from_tool_calls(normalized_command, tool_calls, target)
+
+    if quick_apply then
+        local ran_count = execute_tool_calls_now(tool_calls)
+        local ran_summary = first_preview_action(preview_text)
+        append_history("system", "Ran: " .. ran_summary, true)
+        if show_preview then
+            append_history("system", preview_text, true)
+        end
+        pending_plan = nil
+        set_status(string.format("Ran %d action(s)", ran_count))
+        return
+    end
+
+    pending_plan = {
+        tool_calls = tool_calls,
+        preview = preview_text,
+    }
+    append_history("system", preview_text, show_preview or verbose_history)
+    set_status(string.format("Ready to apply %d action(s)", #tool_calls))
+end
+
+local function submit_user_command(raw_input)
+    local user_input = trim(raw_input)
+    if user_input == "" then
+        last_error = "Enter a command first."
+        set_status("Error: Enter a command first.")
+        return
+    end
+
+    append_history("user", user_input, true)
+
+    local allow_plain_number = pending_intent ~= nil or (last_user_intent and last_user_intent.expects_number)
+    local parameter_only = is_parameter_only_input(user_input, allow_plain_number)
+
+    if pending_intent then
+        if parameter_only then
+            if pending_intent.attempted then
+                last_error = "One follow-up was already used. Try one complete command."
+                append_history("system", "Error: " .. last_error, true)
+                set_status("Error: " .. last_error)
+                pending_intent = nil
+                pending_question = nil
+                return
+            end
+            pending_intent.attempted = true
+            local combined = pending_intent.original_cmd .. " " .. user_input
+            run_command_flow(combined, pending_intent.forced_target, true)
+            return
+        end
+
+        -- User sent a fresh command instead of a numeric fill; clear pending intent.
+        pending_intent = nil
+        pending_question = nil
+        forced_target = nil
+        clarification_attempted = false
+    end
+
+    if parameter_only and last_user_intent and last_user_intent.expects_number then
+        local combined = build_followup_command(last_user_intent, user_input)
+        run_command_flow(combined, last_user_intent.forced_target, true)
+        return
+    end
+
+    run_command_flow(user_input, nil, false)
 end
 
 local function apply_pending_plan()
+    if quick_apply then
+        return
+    end
     if not pending_plan or not pending_plan.tool_calls or #pending_plan.tool_calls == 0 then
         return
     end
 
-    reaper.Undo_BeginBlock()
-    for i = 1, #pending_plan.tool_calls do
-        dispatch_tool_call(pending_plan.tool_calls[i])
-    end
-    reaper.UpdateArrange()
-    reaper.Undo_EndBlock("Cursor AI Edit", -1)
-
-    append_history("system", "Applied edits.")
+    local ran_count = execute_tool_calls_now(pending_plan.tool_calls)
+    append_history("system", "Ran: " .. first_preview_action(pending_plan.preview), true)
+    set_status(string.format("Ran %d action(s)", ran_count))
     pending_plan = nil
 end
 
-local function draw_history()
-    if begin_child_compat("History", -1, 260, true) then
-        for i = 1, #history do
-            local entry = history[i]
-            local prefix = entry.role == "user" and "You: " or "Cursor: "
-            reaper.ImGui_TextWrapped(imgui_ctx, prefix .. entry.text)
-            if i < #history then
-                reaper.ImGui_Separator(imgui_ctx)
+local function draw_history(history_height)
+    if begin_child_compat("History", -1, history_height, true) then
+        local ok, err = pcall(function()
+            for i = 1, #history do
+                local entry = history[i]
+                local prefix = entry.role == "user" and "You" or "Cursor"
+                reaper.ImGui_TextWrapped(imgui_ctx, prefix .. ": " .. entry.text)
+                if i < #history then
+                    reaper.ImGui_Separator(imgui_ctx)
+                end
             end
-        end
-        if scroll_history_to_bottom then
-            reaper.ImGui_SetScrollHereY(imgui_ctx, 1.0)
-            scroll_history_to_bottom = false
+            if scroll_history_to_bottom then
+                reaper.ImGui_SetScrollHereY(imgui_ctx, 1.0)
+                scroll_history_to_bottom = false
+            end
+        end)
+        if not ok then
+            last_error = "UI history render error: " .. tostring(err)
+            set_status("Error: UI history render error")
         end
         reaper.ImGui_EndChild(imgui_ctx)
     end
 end
 
-local function draw_ui()
-    local current_ctx = collect_context()
+local function draw_header(current_ctx)
     local clip_count = #current_ctx.selected_items
     local track_count = #current_ctx.selected_tracks
     local has_time = current_ctx.time_selection ~= nil and "yes" or "no"
@@ -1019,46 +1406,132 @@ local function draw_ui()
     reaper.ImGui_Text(imgui_ctx, "Cursor: " .. format_time(current_ctx.cursor))
 
     reaper.ImGui_Separator(imgui_ctx)
-    draw_history()
 
-    local enter_flag = reaper.ImGui_InputTextFlags_EnterReturnsTrue and reaper.ImGui_InputTextFlags_EnterReturnsTrue() or 0
-    local enter_pressed
-    enter_pressed, command_input = reaper.ImGui_InputText(imgui_ctx, "Command", command_input, enter_flag)
-
-    if enter_pressed and command_input:match("%S") then
-        local cmd = command_input
-        append_history("user", cmd)
-        pending_cmd = cmd
-        clear_pending_plan_state()
-        handle_preview_request(cmd, nil)
-        command_input = ""
-    end
-
-    if reaper.ImGui_Button(imgui_ctx, "Preview") then
-        local cmd = command_input:match("^%s*(.-)%s*$")
-        if cmd ~= "" then
-            append_history("user", cmd)
-            pending_cmd = cmd
-            clear_pending_plan_state()
-            handle_preview_request(cmd, nil)
-            command_input = ""
-        else
-            last_error = "Enter a command first."
-        end
+    local changed_quick
+    changed_quick, quick_apply = checkbox_compat("Quick Apply", quick_apply)
+    if changed_quick and quick_apply and show_preview then
+        -- Keep preview optional in quick mode, defaulting to off.
+        show_preview = false
     end
 
     reaper.ImGui_SameLine(imgui_ctx)
-    local can_apply = pending_plan and pending_plan.tool_calls and #pending_plan.tool_calls > 0
-    if reaper.ImGui_BeginDisabled and reaper.ImGui_EndDisabled then
-        reaper.ImGui_BeginDisabled(imgui_ctx, not can_apply)
-        if reaper.ImGui_Button(imgui_ctx, "Apply") then
+    local _, next_show_preview = checkbox_compat("Show Preview", show_preview)
+    show_preview = next_show_preview
+
+    reaper.ImGui_SameLine(imgui_ctx)
+    local _, next_verbose = checkbox_compat("Verbose History", verbose_history)
+    verbose_history = next_verbose
+
+    if not quick_apply then
+        reaper.ImGui_SameLine(imgui_ctx)
+        local can_apply = pending_plan and pending_plan.tool_calls and #pending_plan.tool_calls > 0
+        if reaper.ImGui_BeginDisabled and reaper.ImGui_EndDisabled then
+            reaper.ImGui_BeginDisabled(imgui_ctx, not can_apply)
+            if reaper.ImGui_Button(imgui_ctx, "Apply") then
+                apply_pending_plan()
+            end
+            reaper.ImGui_EndDisabled(imgui_ctx)
+        elseif can_apply and reaper.ImGui_Button(imgui_ctx, "Apply") then
             apply_pending_plan()
+        else
+            reaper.ImGui_Button(imgui_ctx, "Apply")
         end
-        reaper.ImGui_EndDisabled(imgui_ctx)
-    else
-        if reaper.ImGui_Button(imgui_ctx, can_apply and "Apply" or "Apply (no plan)") and can_apply then
-            apply_pending_plan()
+    end
+
+    reaper.ImGui_Separator(imgui_ctx)
+    local status_text = is_planning and "Planning..." or status_line
+    reaper.ImGui_TextWrapped(imgui_ctx, "Status: " .. status_text)
+end
+
+local function draw_pending_question()
+    if not pending_question then
+        return
+    end
+
+    reaper.ImGui_Separator(imgui_ctx)
+    reaper.ImGui_TextWrapped(imgui_ctx, pending_question)
+
+    if question_is_target_choice(pending_question) then
+        if reaper.ImGui_Button(imgui_ctx, "Apply to Clip(s)") then
+            if clarification_attempted then
+                last_error = "Clarification already used. Try one complete command."
+                append_history("system", "Error: " .. last_error, true)
+                set_status("Error: " .. last_error)
+                pending_intent = nil
+                clear_pending_plan_state()
+            elseif pending_intent and pending_intent.original_cmd then
+                clarification_attempted = true
+                forced_target = "clips"
+                pending_intent.forced_target = "clips"
+                run_command_flow(pending_intent.original_cmd, "clips", true)
+            end
         end
+
+        reaper.ImGui_SameLine(imgui_ctx)
+        if reaper.ImGui_Button(imgui_ctx, "Apply to Track(s)") then
+            if clarification_attempted then
+                last_error = "Clarification already used. Try one complete command."
+                append_history("system", "Error: " .. last_error, true)
+                set_status("Error: " .. last_error)
+                pending_intent = nil
+                clear_pending_plan_state()
+            elseif pending_intent and pending_intent.original_cmd then
+                clarification_attempted = true
+                forced_target = "tracks"
+                pending_intent.forced_target = "tracks"
+                run_command_flow(pending_intent.original_cmd, "tracks", true)
+            end
+        end
+    end
+end
+
+local function draw_preview_block()
+    reaper.ImGui_Separator(imgui_ctx)
+    reaper.ImGui_Text(imgui_ctx, "Preview")
+    if begin_child_compat("PreviewArea", -1, 120, true) then
+        local ok, err = pcall(function()
+            local pushed = push_mono_font_if_available()
+            reaper.ImGui_TextWrapped(imgui_ctx, normalize_text(last_preview or "No preview yet."))
+            pop_mono_font_if_pushed(pushed)
+        end)
+        if not ok then
+            last_error = "UI preview render error: " .. tostring(err)
+            set_status("Error: UI preview render error")
+        end
+        reaper.ImGui_EndChild(imgui_ctx)
+    end
+end
+
+local function draw_error_block()
+    if not last_error or trim(last_error) == "" then
+        return
+    end
+    reaper.ImGui_Separator(imgui_ctx)
+    reaper.ImGui_TextWrapped(imgui_ctx, "Error: " .. normalize_text(last_error))
+end
+
+local function draw_input_bar()
+    reaper.ImGui_Separator(imgui_ctx)
+    local run_label = quick_apply and "Run" or "Send"
+    local run_width = 70
+    local clear_width = 60
+    local spacing = 12
+    local available_width = select(1, reaper.ImGui_GetContentRegionAvail(imgui_ctx))
+    available_width = tonumber(available_width) or 260
+    local input_width = math.max(120, available_width - run_width - clear_width - spacing)
+
+    if reaper.ImGui_SetNextItemWidth then
+        reaper.ImGui_SetNextItemWidth(imgui_ctx, input_width)
+    end
+
+    local enter_flag = reaper.ImGui_InputTextFlags_EnterReturnsTrue and reaper.ImGui_InputTextFlags_EnterReturnsTrue() or 0
+    local enter_pressed
+    enter_pressed, command_input = reaper.ImGui_InputText(imgui_ctx, "##CommandInput", command_input, enter_flag)
+
+    reaper.ImGui_SameLine(imgui_ctx)
+    if reaper.ImGui_Button(imgui_ctx, run_label) then
+        submit_user_command(command_input)
+        command_input = ""
     end
 
     reaper.ImGui_SameLine(imgui_ctx)
@@ -1066,62 +1539,76 @@ local function draw_ui()
         clear_state()
     end
 
-    if pending_question then
-        reaper.ImGui_Separator(imgui_ctx)
-        reaper.ImGui_TextWrapped(imgui_ctx, normalize_text(pending_question))
+    if enter_pressed then
+        submit_user_command(command_input)
+        command_input = ""
+    end
+end
 
-        if reaper.ImGui_Button(imgui_ctx, "Clips") then
-            if clarification_attempted then
-                last_error = "Clarification already used. Try a new command."
-                clear_pending_plan_state()
-            elseif pending_cmd and pending_cmd ~= "" then
-                clarification_attempted = true
-                forced_target = "clips"
-                handle_preview_request(pending_cmd, "clips")
-            end
-        end
-        reaper.ImGui_SameLine(imgui_ctx)
-        if reaper.ImGui_Button(imgui_ctx, "Tracks") then
-            if clarification_attempted then
-                last_error = "Clarification already used. Try a new command."
-                clear_pending_plan_state()
-            elseif pending_cmd and pending_cmd ~= "" then
-                clarification_attempted = true
-                forced_target = "tracks"
-                handle_preview_request(pending_cmd, "tracks")
-            end
-        end
+local function draw_ui()
+    local pushed_style = 0
+    if reaper.ImGui_PushStyleVar and reaper.ImGui_StyleVar_WindowPadding then
+        reaper.ImGui_PushStyleVar(imgui_ctx, reaper.ImGui_StyleVar_WindowPadding(), 12, 10)
+        pushed_style = pushed_style + 1
+    end
+    if reaper.ImGui_PushStyleVar and reaper.ImGui_StyleVar_FramePadding then
+        reaper.ImGui_PushStyleVar(imgui_ctx, reaper.ImGui_StyleVar_FramePadding(), 8, 6)
+        pushed_style = pushed_style + 1
+    end
+    if reaper.ImGui_PushStyleVar and reaper.ImGui_StyleVar_ItemSpacing then
+        reaper.ImGui_PushStyleVar(imgui_ctx, reaper.ImGui_StyleVar_ItemSpacing(), 8, 8)
+        pushed_style = pushed_style + 1
     end
 
-    reaper.ImGui_Separator(imgui_ctx)
-    reaper.ImGui_Text(imgui_ctx, "Preview")
-    if begin_child_compat("PreviewArea", -1, 120, true) then
-        reaper.ImGui_TextWrapped(imgui_ctx, normalize_text(last_preview or "No preview yet."))
-        reaper.ImGui_EndChild(imgui_ctx)
-    end
+    local current_ctx = collect_context()
+    draw_header(current_ctx)
 
-    if last_error then
-        reaper.ImGui_Separator(imgui_ctx)
-        reaper.ImGui_TextWrapped(imgui_ctx, "Error: " .. normalize_text(last_error))
+    local available_height = select(2, reaper.ImGui_GetContentRegionAvail(imgui_ctx))
+    available_height = tonumber(available_height) or 520
+    local history_height = math.max(120, available_height - 320)
+    draw_history(history_height)
+    draw_pending_question()
+    draw_preview_block()
+    draw_error_block()
+    draw_input_bar()
+
+    if reaper.ImGui_PopStyleVar and pushed_style > 0 then
+        reaper.ImGui_PopStyleVar(imgui_ctx, pushed_style)
     end
 end
 
 local function loop()
-    local cond_first = reaper.ImGui_Cond_FirstUseEver and reaper.ImGui_Cond_FirstUseEver() or 0
-    reaper.ImGui_SetNextWindowSize(imgui_ctx, 520, 760, cond_first)
-    reaper.ImGui_SetNextWindowPos(imgui_ctx, 1100, 60, cond_first)
-
-    local visible, open = reaper.ImGui_Begin(imgui_ctx, WINDOW_TITLE, true)
-    if visible then
-        draw_ui()
-        reaper.ImGui_End(imgui_ctx)
+    if not imgui_ctx then
+        return
     end
 
-    if open then
+    local ok, open_or_err = pcall(function()
+        local cond_first = reaper.ImGui_Cond_FirstUseEver and reaper.ImGui_Cond_FirstUseEver() or 0
+        reaper.ImGui_SetNextWindowSize(imgui_ctx, 560, 820, cond_first)
+        reaper.ImGui_SetNextWindowPos(imgui_ctx, 1040, 40, cond_first)
+
+        local visible, open = reaper.ImGui_Begin(imgui_ctx, WINDOW_TITLE, true)
+        if visible then
+            draw_ui()
+            reaper.ImGui_End(imgui_ctx)
+        end
+        return open
+    end)
+
+    if not ok then
+        pcall(reaper.ShowMessageBox, "Cursor panel UI error:\n" .. tostring(open_or_err), "Cursor for DAWs", 0)
+        pcall(reaper.ImGui_DestroyContext, imgui_ctx)
+        imgui_ctx = nil
+        return
+    end
+
+    if open_or_err then
         reaper.defer(loop)
-    else
-        reaper.ImGui_DestroyContext(imgui_ctx)
+        return
     end
+
+    pcall(reaper.ImGui_DestroyContext, imgui_ctx)
+    imgui_ctx = nil
 end
 
 loop()

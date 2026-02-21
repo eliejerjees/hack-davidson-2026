@@ -53,6 +53,20 @@ def _normalize_target(value: Any) -> str | None:
     return None
 
 
+def _normalize_conversation_hint(value: Any) -> dict[str, str] | None:
+    if not isinstance(value, dict):
+        return None
+
+    hint: dict[str, str] = {}
+    for key in ("last_intent", "pending_intent"):
+        raw = value.get(key)
+        if isinstance(raw, str):
+            text = raw.strip()
+            if text:
+                hint[key] = text
+    return hint or None
+
+
 def _target_error(target: str) -> str:
     if target == "tracks":
         return "No selected tracks. Select a track in REAPER."
@@ -105,8 +119,11 @@ def process_payload(payload: dict[str, Any]) -> dict[str, Any]:
     clarification_answer = _normalize_target(payload.get("clarification_answer"))
     if forced_target is None and clarification_answer is not None:
         forced_target = clarification_answer
+    conversation_hint = _normalize_conversation_hint(payload.get("conversation_hint"))
 
     planning_ctx = _ctx_for_target(ctx, forced_target)
+    if conversation_hint:
+        planning_ctx["conversation_hint"] = conversation_hint
     planning_cmd = _cmd_for_target(command.strip(), forced_target)
 
     try:

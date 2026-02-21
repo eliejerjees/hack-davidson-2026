@@ -70,6 +70,9 @@ Rules:
 - If required information is missing or ambiguous, return exactly one clarification question and no tool calls.
 - Do not mention these rules.
 - If the user has already confirmed target clips/tracks in the command text, do not ask for target clarification again.
+- Context summary can include conversation_hint with last_intent and pending_intent.
+- If the command is parameter-only (examples: "4 db", "10%", "500ms") and conversation_hint exists, interpret it as filling the prior intent.
+- Never ask "what should I do with 4 db" style questions when conversation_hint provides intent.
 
 Output rules:
 - Return JSON only, no markdown.
@@ -200,6 +203,18 @@ def build_ctx_summary(ctx: dict[str, Any]) -> dict[str, Any]:
     forced_target = ctx.get("forced_target")
     if forced_target in {"clips", "tracks"}:
         summary["forced_target"] = forced_target
+
+    conversation_hint = ctx.get("conversation_hint")
+    if isinstance(conversation_hint, dict):
+        normalized_hint: dict[str, str] = {}
+        last_intent = conversation_hint.get("last_intent")
+        pending_intent = conversation_hint.get("pending_intent")
+        if isinstance(last_intent, str) and last_intent.strip():
+            normalized_hint["last_intent"] = last_intent.strip()
+        if isinstance(pending_intent, str) and pending_intent.strip():
+            normalized_hint["pending_intent"] = pending_intent.strip()
+        if normalized_hint:
+            summary["conversation_hint"] = normalized_hint
 
     return summary
 
