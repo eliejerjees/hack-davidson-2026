@@ -251,6 +251,55 @@ function solo(state)
     )
 end
 
+------------------------------
+-- SPLIT ITEM
+------------------------------
+
+function split_item_middle()
+
+    local ctx = get_context()
+
+    for i=1,#ctx.items do
+
+        local item = ctx.items[i]
+
+        local pos =
+        reaper.GetMediaItemInfo_Value(
+        item,
+        "D_POSITION")
+
+        local len =
+        reaper.GetMediaItemInfo_Value(
+        item,
+        "D_LENGTH")
+
+        local middle =
+        pos + len/2
+
+        reaper.SplitMediaItem(
+        item,
+        middle)
+
+    end
+
+end
+
+------------------------------
+-- MOVE CURSOR
+------------------------------
+
+function move_cursor(seconds)
+
+    local pos =
+    reaper.GetCursorPosition()
+
+    reaper.SetEditCurPos(
+    pos+seconds,
+    true,
+    false)
+
+end
+
 -----------------------------------
 -- Example Calls (Test Section)
 -----------------------------------
