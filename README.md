@@ -140,10 +140,7 @@ If ffmpeg is not found at the configured path, Speech recording is disabled and 
 - `mute()` / `unmute()`
 - `solo()` / `unsolo()`
 - `crossfade(seconds)`
-- `cut_middle(seconds)`
 - `split_at_cursor()`
-- `duplicate(count)`
-- `trim_to_time_selection()`
 
 ## Volume Interpretation
 
@@ -154,4 +151,3 @@ If ffmpeg is not found at the configured path, Speech recording is disabled and 
 ## Speech Notes
 
 - This implementation includes **speech only** (STT + TTS).
-- Music generation is **not** implemented in this feature set.
