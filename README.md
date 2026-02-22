@@ -6,7 +6,7 @@ Primary UX is `cursor_panel.lua` (dockable ReaImGui sidebar panel).
 
 ## Core Flow
 
-1. User enters text command (or voice command) in REAPER.
+1. User enters a text command (or voice command) in REAPER.
 2. REAPER sends command + live selection context to `reaper_py/bridge.py`.
 3. Python runs Gemini planner -> validation -> tool call plan.
 4. REAPER executes validated tool calls in one Undo block.
@@ -23,12 +23,18 @@ Safety:
 - ReaPack + ReaImGui
 - Python 3.10+
 - Gemini API key
-- ElevenLabs API key (for Speech tab STT/TTS)
-- `ffmpeg` in PATH (for Speech tab recording)
+- ElevenLabs API key (Speech tab: STT/TTS)
+- `ffmpeg` installed (Speech tab recording)
 
 `ffmpeg` quick install:
 - macOS (Homebrew): `brew install ffmpeg`
 - Windows (Chocolatey): `choco install ffmpeg`
+- Linux (Debian/Ubuntu): `sudo apt install ffmpeg`
+
+Important:
+- `cursor_panel.lua` currently uses a fixed ffmpeg path:
+  - `local FFMPEG = "/opt/homebrew/bin/ffmpeg"`
+- If ffmpeg is installed elsewhere on your machine, update that constant in `cursor_panel.lua`.
 
 ## Setup
 
@@ -71,18 +77,31 @@ ELEVENLABS_VOICE_ID=your_default_voice_id
 
 In `Actions -> Show action list... -> ReaScript -> Load...`:
 
-- Main panel: `/Users/eliejerjees/Desktop/Personal Projects/hack-davidson-2026/cursor_panel.lua`
-- Fallback dialog script: `/Users/eliejerjees/Desktop/Personal Projects/hack-davidson-2026/cursor.lua`
+- Main panel: `<repo>/cursor_panel.lua`
+- Fallback dialog script: `<repo>/cursor.lua`
 
 ## Dock as Sidebar (Right Docker)
 
 1. Run `cursor_panel.lua`.
-2. Drag the `Cursor for DAWs` tab/title bar into REAPER’s right docker area.
+2. Drag the `Cursor for DAWs` tab/title bar into REAPER's right docker area.
 3. Drop when the dock highlight appears.
 
 REAPER remembers docked layout after that. Screensets can be used if needed.
 
-## Panel UX
+## Execution Modes
+
+### `cursor_panel.lua` (primary)
+- Chat-style docked panel UX.
+- Successful plans execute immediately after validation.
+- Clarification uses one turn max (buttons for clip/track target).
+- All edits run inside a single Undo block.
+
+### `cursor.lua` (fallback)
+- Dialog-based flow.
+- Shows preview text and asks Apply confirmation before execution.
+- Useful when ReaImGui is unavailable.
+
+## Panel UX (`cursor_panel.lua`)
 
 Top status:
 - `Selected clips`
@@ -103,12 +122,12 @@ Tabs:
 
 ### Speech
 - Voice command recording (`Start Recording`) with 3s/5s/8s duration
-- STT transcription via ElevenLabs, then runs same command pipeline
+- STT transcription via ElevenLabs, then runs the same command pipeline
 - `Speak after running a command` toggle (TTS)
 - `Speak last response` button
 - Optional voice ID override field
 
-If `ffmpeg` is missing, Speech tab shows a clear error and recording is disabled.
+If ffmpeg is not found at the configured path, Speech recording is disabled and an error is shown.
 
 ## Whitelisted Tools
 
@@ -136,7 +155,3 @@ If `ffmpeg` is missing, Speech tab shows a clear error and recording is disabled
 
 - This implementation includes **speech only** (STT + TTS).
 - Music generation is **not** implemented in this feature set.
-
-## Fallback Script
-
-If ReaImGui is unavailable, run `cursor.lua` (dialog-based flow).
