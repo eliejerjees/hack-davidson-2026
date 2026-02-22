@@ -1,30 +1,38 @@
 # Cursor for DAWs (Hackathon MVP)
 
-Gemini-first REAPER assistant with strict tool-calling, hard validation, preview rendering, and explicit Apply gating.
+Gemini-first REAPER assistant with strict tool-calling, hard validation, and in-REAPER execution.
 
-Primary UX is a dockable ReaImGui panel inside REAPER (`cursor_panel.lua`).
+Primary UX is `cursor_panel.lua` (dockable ReaImGui sidebar panel).
 
-## What It Does
+## Core Flow
 
-Flow:
-1. User enters natural language command in REAPER panel.
-2. REAPER sends command + live selection context to Python bridge.
-3. Python runs Gemini planner -> validation -> preview.
-4. REAPER shows preview.
-5. Only when user clicks **Apply**, REAPER executes tool calls in an undo block.
+1. User enters text command (or voice command) in REAPER.
+2. REAPER sends command + live selection context to `reaper_py/bridge.py`.
+3. Python runs Gemini planner -> validation -> tool call plan.
+4. REAPER executes validated tool calls in one Undo block.
 
-No edits occur before Apply.
+Safety:
+- Gemini is always used for natural language interpretation.
+- Tool calls are whitelist-only and schema-validated.
+- No execution occurs on planning/validation failure.
+- Every edit is wrapped in Undo (`Cmd/Ctrl+Z`).
 
 ## Requirements
 
 - REAPER
-- ReaPack + ReaImGui extension
+- ReaPack + ReaImGui
 - Python 3.10+
 - Gemini API key
+- ElevenLabs API key (for Speech tab STT/TTS)
+- `ffmpeg` in PATH (for Speech tab recording)
+
+`ffmpeg` quick install:
+- macOS (Homebrew): `brew install ffmpeg`
+- Windows (Chocolatey): `choco install ffmpeg`
 
 ## Setup
 
-### 1) Python
+### 1) Python environment
 
 ```bash
 python3 -m venv .venv
@@ -32,7 +40,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-`requirements.txt`:
+Dependencies:
 - `requests`
 - `python-dotenv`
 
@@ -42,11 +50,13 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Edit `.env`:
+Set values in `.env`:
 
 ```env
-GEMINI_API_KEY=your_real_key
+GEMINI_API_KEY=your_gemini_key
 GEMINI_MODEL=gemini-2.5-flash
+ELEVENLABS_API_KEY=your_elevenlabs_key
+ELEVENLABS_VOICE_ID=your_default_voice_id
 ```
 
 `.env` is gitignored. Do not commit secrets.
@@ -55,50 +65,59 @@ GEMINI_MODEL=gemini-2.5-flash
 
 1. Install ReaPack: [https://reapack.com](https://reapack.com)
 2. In REAPER: `Extensions -> ReaPack -> Browse packages`
-3. Search and install `ReaImGui`
-4. Restart REAPER if prompted.
+3. Install `ReaImGui`
 
 ### 4) Load scripts in REAPER
 
-1. Open `Actions -> Show action list...`
-2. Click `ReaScript -> Load...`
-3. Load `/Users/eliejerjees/Desktop/Personal Projects/hack-davidson-2026/cursor_panel.lua`
-4. (Optional fallback) also load `/Users/eliejerjees/Desktop/Personal Projects/hack-davidson-2026/cursor.lua`
+In `Actions -> Show action list... -> ReaScript -> Load...`:
 
-## Primary REAPER UX (Panel)
+- Main panel: `/Users/eliejerjees/Desktop/Personal Projects/hack-davidson-2026/cursor_panel.lua`
+- Fallback dialog script: `/Users/eliejerjees/Desktop/Personal Projects/hack-davidson-2026/cursor.lua`
 
-Run `cursor_panel.lua`.
+## Dock as Sidebar (Right Docker)
 
-Dock as sidebar:
-1. Run the panel once.
-2. Drag the `Cursor for DAWs` tab/title bar into REAPER's right docker area.
-3. Release when REAPER shows the right-dock drop highlight.
+1. Run `cursor_panel.lua`.
+2. Drag the `Cursor for DAWs` tab/title bar into REAPER’s right docker area.
+3. Drop when the dock highlight appears.
 
-After docking once, REAPER will remember the layout on future runs. If needed, save/restore with REAPER screensets.
+REAPER remembers docked layout after that. Screensets can be used if needed.
 
-Panel features:
-- Dockable window titled **Cursor for DAWs**
-- Live status row (selected clips, selected tracks, time selection, cursor)
-- Chat history
-- Command input + `Preview` button
-- `Apply` button (only enabled with valid pending plan)
-- `Clear` button
-- Preview area + error/status line
+## Panel UX
 
-Clarification behavior:
-- At most one clarification turn (`Clips` / `Tracks` buttons)
-- If still infeasible, panel shows one error and stops
+Top status:
+- `Selected clips`
+- `Selected tracks`
+- `Time selection`
+- `Cursor`
+- `Status`
+
+Tabs:
+
+### Commands
+- Scrollable history log (always visible)
+- Input + `Run` (or Enter) + `Clear`
+- Immediate execution on success
+- Clarification buttons for ambiguous target:
+  - `Apply to Track(s)`
+  - `Apply to Clip(s)`
+
+### Speech
+- Voice command recording (`Start Recording`) with 3s/5s/8s duration
+- STT transcription via ElevenLabs, then runs same command pipeline
+- `Speak after running a command` toggle (TTS)
+- `Speak last response` button
+- Optional voice ID override field
+
+If `ffmpeg` is missing, Speech tab shows a clear error and recording is disabled.
 
 ## Whitelisted Tools
-
-Only these tool calls are allowed:
 
 - `fade_out(seconds)`
 - `fade_in(seconds)`
 - `set_volume_delta(db | percent)`
 - `set_volume_set(percent)`
-- `set_pan(pan)` where `pan` is integer `-100..100`
-- `add_fx(type)` where type is `compressor|eq|reverb`
+- `set_pan(pan)`
+- `add_fx(type)`
 - `mute()` / `unmute()`
 - `solo()` / `unsolo()`
 - `crossfade(seconds)`
@@ -109,52 +128,15 @@ Only these tool calls are allowed:
 
 ## Volume Interpretation
 
-- `lower volume by 3` -> dB mode -> `set_volume_delta({"db": -3})`
-- `lower volume by 3%` -> percent delta mode -> `set_volume_delta({"percent": -3})`
-- `set volume to 50%` -> absolute percent mode -> `set_volume_set({"percent": 50})`
+- `lower volume by 3` -> dB mode
+- `lower volume by 3%` -> percent delta mode
+- `set volume to 50%` -> absolute percent mode
 
-Preview explicitly shows which interpretation was used.
+## Speech Notes
 
-## Manual Acceptance Tests (REAPER)
-
-1. Select one clip:
-   - Command: `fade this out by 500 ms`
-   - Expect preview, then Apply changes clip fade.
-
-2. Select one track:
-   - Command: `lower volume by 3`
-   - Expect dB preview, Apply changes track volume.
-
-3. Select one track:
-   - Command: `lower volume by 3%`
-   - Expect percent preview with gain multiplier, Apply changes track volume.
-
-4. No track selected:
-   - Command: `lower volume by 3`
-   - Expect single clarification/error, no loop, no edit.
-
-5. Two clips selected:
-   - Command: `crossfade these by half a second`
-   - Expect preview and crossfade on Apply.
+- This implementation includes **speech only** (STT + TTS).
+- Music generation is **not** implemented in this feature set.
 
 ## Fallback Script
 
-If ReaImGui is not installed, run `cursor.lua` (dialog-based flow).
-It uses the same Python bridge and still enforces preview + explicit Apply.
-
-## Dev Harness (Optional)
-
-Run:
-
-```bash
-python3 -m reaper_py.main
-```
-
-Mock selection commands:
-- `select a track`
-- `select a clip`
-- `select two clips`
-- `select a time range`
-- `clear selection`
-
-Harness also uses the same bridge pipeline and supports one clarification turn.
+If ReaImGui is unavailable, run `cursor.lua` (dialog-based flow).

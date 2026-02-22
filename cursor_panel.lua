@@ -1,5 +1,5 @@
 -- Cursor for DAWs - ReaImGui docked panel UI
--- Primary in-REAPER UX (chat + preview + apply)
+-- Primary in-REAPER UX (chat + command + speech)
 
 if not reaper.ImGui_CreateContext then
     reaper.ShowMessageBox(
@@ -16,6 +16,8 @@ local WINDOW_TITLE = "Cursor for DAWs"
 local EXTSTATE_SECTION = "CursorForDAWsPanel"
 local EXTSTATE_DOCK_HINT_KEY = "dock_hint_dismissed"
 local EXTSTATE_AUTODOCK_KEY = "autodock_attempted"
+local FFMPEG = "/opt/homebrew/bin/ffmpeg"
+local AFPLAY = "/usr/bin/afplay"
 
 local function get_extstate(key, default_value)
     if reaper.GetExtState then
@@ -54,25 +56,35 @@ end
 
 local history = {}
 local command_input = ""
-local pending_plan = nil
 local pending_question = nil
 local pending_intent = nil
 local last_user_intent = nil
 local forced_target = nil
 local clarification_attempted = false
-local last_preview = "No preview yet."
 local last_error = nil
 local status_line = "Ready"
 local is_planning = false
-local quick_apply = true
-local show_preview = false
-local verbose_history = false
 local scroll_history_to_bottom = false
 local show_dock_hint = get_extstate(EXTSTATE_DOCK_HINT_KEY, "0") ~= "1"
 local autodock_pending = get_extstate(EXTSTATE_AUTODOCK_KEY, "0") ~= "1"
-
-local mono_font = nil
--- Disabled by default for wide ReaImGui compatibility across versions.
+local speech_status_line = "Idle"
+local speech_error = nil
+local speak_after_run = false
+local speech_last_response = ""
+local speech_voice_override = ""
+local speech_audio_device_override = ""
+local stt_duration_options = {3, 5, 8}
+local stt_duration_index = 2
+local ffmpeg_checked = false
+local ffmpeg_available = false
+local ffmpeg_error = nil
+local speech_recording_active = false
+local speech_recording_started_at = 0
+local speech_recording_duration = 0
+local speech_recording_audio_path = nil
+local speech_recording_pid_path = nil
+local speech_recording_log_path = nil
+local macos_audio_input_index_cache = nil
 
 
 local function clamp(value, min_value, max_value)
@@ -106,28 +118,42 @@ local function trim(text)
     return tostring(text or ""):match("^%s*(.-)%s*$")
 end
 
-local function append_history(role, text, always)
-    if role ~= "user" and not always and not verbose_history then
-        return
+local function get_os_details()
+    local os_name = ""
+    if reaper.GetOS then
+        os_name = tostring(reaper.GetOS() or "")
     end
+    local lower = string.lower(os_name)
+    return os_name, lower
+end
+
+local function is_windows_os(os_lower)
+    return os_lower:find("win", 1, true) ~= nil
+end
+
+local function is_macos_os(os_lower)
+    return os_lower:find("osx", 1, true) ~= nil
+        or os_lower:find("mac", 1, true) ~= nil
+        or os_lower:find("darwin", 1, true) ~= nil
+end
+
+local function append_history(role, text, always)
     history[#history + 1] = {role = role, text = normalize_text(text)}
     scroll_history_to_bottom = true
 end
 
 local function set_status(text)
-    status_line = tostring(text or "Ready")
-end
-
-local function push_mono_font_if_available()
-    -- Keep preview rendering stable across ReaImGui bindings.
-    -- If needed later, this can be re-enabled behind a verified version check.
-    return false
-end
-
-local function pop_mono_font_if_pushed(pushed)
-    if pushed and reaper.ImGui_PopFont then
-        pcall(reaper.ImGui_PopFont, imgui_ctx)
+    local value = tostring(text or "Ready")
+    value = value:gsub("[\r\n]+", " ")
+    value = value:gsub("%s+", " ")
+    value = trim(value)
+    if value == "" then
+        value = "Ready"
     end
+    if #value > 220 then
+        value = value:sub(1, 217) .. "..."
+    end
+    status_line = value
 end
 
 local function checkbox_compat(label, current_value)
@@ -147,14 +173,24 @@ end
 local function clear_state()
     history = {}
     command_input = ""
-    pending_plan = nil
     pending_question = nil
     pending_intent = nil
     last_user_intent = nil
     forced_target = nil
     clarification_attempted = false
-    last_preview = "No preview yet."
+    speech_last_response = ""
+    speech_audio_device_override = ""
     last_error = nil
+    speech_error = nil
+    speech_status_line = "Idle"
+    speech_recording_active = false
+    speech_recording_started_at = 0
+    speech_recording_duration = 0
+    speech_recording_audio_path = nil
+    speech_recording_pid_path = nil
+    speech_recording_log_path = nil
+    macos_audio_input_index_cache = nil
+    scroll_history_to_bottom = false
     set_status("Ready")
 end
 
@@ -172,28 +208,28 @@ local function begin_child_compat(id, width, height, bordered)
     -- Newer API: BeginChild(ctx, id, w, h, child_flags, window_flags)
     local ok_new, visible_new = pcall(reaper.ImGui_BeginChild, imgui_ctx, id, width, height, border_flag, 0)
     if ok_new then
-        return visible_new
+        return true, visible_new
     end
 
     -- Older API: BeginChild(ctx, id, w, h, flags)
     local ok_old_flags, visible_old_flags = pcall(reaper.ImGui_BeginChild, imgui_ctx, id, width, height, border_flag)
     if ok_old_flags then
-        return visible_old_flags
+        return true, visible_old_flags
     end
 
     -- Legacy API: BeginChild(ctx, id, w, h, border_bool)
     local ok_legacy, visible_legacy = pcall(reaper.ImGui_BeginChild, imgui_ctx, id, width, height, bordered and true or false)
     if ok_legacy then
-        return visible_legacy
+        return true, visible_legacy
     end
 
     -- Final fallback with minimal args.
     local ok_min, visible_min = pcall(reaper.ImGui_BeginChild, imgui_ctx, id, width, height)
     if ok_min then
-        return visible_min
+        return true, visible_min
     end
 
-    return false
+    return false, false
 end
 
 local function shell_quote(value)
@@ -203,6 +239,11 @@ local function shell_quote(value)
         :gsub("%$", "\\$")
         :gsub("`", "\\`")
     return '"' .. escaped .. '"'
+end
+
+local function shell_single_quote(value)
+    local escaped = tostring(value):gsub("'", [['"'"']])
+    return "'" .. escaped .. "'"
 end
 
 local function read_file(path)
@@ -224,6 +265,28 @@ local function file_exists(path)
     return false
 end
 
+local function file_size(path)
+    local file = io.open(path, "rb")
+    if not file then
+        return nil
+    end
+    local size = file:seek("end")
+    file:close()
+    return size
+end
+
+local function read_pid_from_file(path)
+    local raw = read_file(path)
+    if not raw then
+        return nil
+    end
+    local pid_text = tostring(raw):match("(%d+)")
+    if not pid_text then
+        return nil
+    end
+    return tonumber(pid_text)
+end
+
 local function write_file(path, contents)
     local file = io.open(path, "wb")
     if not file then
@@ -242,15 +305,23 @@ local function get_script_dir()
     return source:match("^(.*)[/\\]") or "."
 end
 
-local function make_temp_json_path(kind)
+local function make_temp_path(kind, extension)
+    local ext = extension or "json"
+    if ext:sub(1, 1) == "." then
+        ext = ext:sub(2)
+    end
     local tmp = os.tmpname()
     if not tmp or tmp == "" then
         local base = reaper.GetResourcePath()
         local now_ms = math.floor(reaper.time_precise() * 1000)
         local suffix = math.random(100000, 999999)
-        return string.format("%s/cursor_panel_%s_%d_%d.json", base, kind, now_ms, suffix)
+        return string.format("%s/cursor_panel_%s_%d_%d.%s", base, kind, now_ms, suffix, ext)
     end
-    return tmp .. "_" .. kind .. ".json"
+    return tmp .. "_" .. kind .. "." .. ext
+end
+
+local function make_temp_json_path(kind)
+    return make_temp_path(kind, "json")
 end
 
 local function get_python_executable(script_dir)
@@ -992,10 +1063,324 @@ local function run_bridge_payload(payload)
 end
 
 local function clear_pending_plan_state()
-    pending_plan = nil
     pending_question = nil
     forced_target = nil
     clarification_attempted = false
+end
+
+local function run_shell_command(command, timeout_ms, use_zsh_fallback)
+    local attempts = {command}
+    local _, os_lower = get_os_details()
+    local allow_fallback = use_zsh_fallback
+    if allow_fallback == nil then
+        allow_fallback = true
+    end
+    if allow_fallback and not is_windows_os(os_lower) then
+        attempts[#attempts + 1] = string.format("/bin/zsh -lc %s", shell_quote(command))
+    end
+
+    local diagnostics = {}
+    for i = 1, #attempts do
+        local cmd = attempts[i]
+        local exit_code, output = reaper.ExecProcess(cmd, timeout_ms or 15000)
+        if tonumber(exit_code) == 0 then
+            return true, output or ""
+        end
+        diagnostics[#diagnostics + 1] = string.format("[attempt %d exit=%s] %s", i, tostring(exit_code), output or "")
+    end
+    return false, nil, table.concat(diagnostics, "\n")
+end
+
+local function run_python_script(script_rel_path, args, timeout_ms)
+    local script_dir = get_script_dir()
+    local script_path = script_dir .. "/" .. script_rel_path
+    if not file_exists(script_path) then
+        return false, nil, "Missing script: " .. script_path
+    end
+
+    local python_exec = get_python_executable(script_dir)
+    local exec_candidates = {python_exec}
+    if python_exec ~= "python3" then
+        exec_candidates[#exec_candidates + 1] = "python3"
+    end
+
+    local diagnostics = {}
+    for i = 1, #exec_candidates do
+        local executable = exec_candidates[i]
+        local parts = {
+            shell_quote(executable),
+            shell_quote(script_path),
+        }
+        for j = 1, #args do
+            parts[#parts + 1] = shell_quote(tostring(args[j]))
+        end
+        local command = table.concat(parts, " ")
+        local ok, output, err = run_shell_command(command, timeout_ms or 30000, false)
+        if ok then
+            return true, output, nil
+        end
+        diagnostics[#diagnostics + 1] = string.format("[%s] %s", executable, err or "unknown error")
+    end
+    return false, nil, table.concat(diagnostics, "\n---\n")
+end
+
+local function detect_ffmpeg()
+    if ffmpeg_checked then
+        return ffmpeg_available
+    end
+
+    ffmpeg_checked = true
+
+    -- First: check file exists
+    if file_exists(FFMPEG) then
+        ffmpeg_available = true
+        return true
+    end
+
+    -- Fallback: try executing
+    local ok = run_shell_command(shell_quote(FFMPEG) .. " -version", 6000, false)
+    ffmpeg_available = ok and true or false
+
+    if not ffmpeg_available then
+        ffmpeg_error = "Recording requires ffmpeg at: " .. FFMPEG
+    end
+
+    return ffmpeg_available
+end
+
+local function detect_macos_audio_input_index()
+    local _, os_lower = get_os_details()
+    if not is_macos_os(os_lower) then
+        return 0
+    end
+
+    local override_text = trim(speech_audio_device_override or "")
+    local override_number = tonumber(override_text)
+    if override_number then
+        return math.max(0, math.floor(override_number))
+    end
+
+    local env_override = tonumber(os.getenv("CURSOR_AVFOUNDATION_AUDIO_INDEX") or "")
+    if env_override then
+        return math.max(0, math.floor(env_override))
+    end
+
+    if macos_audio_input_index_cache ~= nil then
+        return macos_audio_input_index_cache
+    end
+
+    local list_cmd = string.format(
+        "%s -hide_banner -f avfoundation -list_devices true -i %s",
+        shell_quote(FFMPEG),
+        shell_quote("")
+    )
+    local ok, output, err = run_shell_command(list_cmd, 8000, false)
+    local text = tostring(output or "")
+    if text == "" and err then
+        text = tostring(err)
+    end
+
+    local in_audio_section = false
+    local first_index = nil
+    local preferred_index = nil
+    for line in text:gmatch("[^\r\n]+") do
+        local lower = string.lower(line)
+        if lower:find("audio devices", 1, true) then
+            in_audio_section = true
+        elseif in_audio_section and lower:find("video devices", 1, true) then
+            in_audio_section = false
+        end
+
+        if in_audio_section then
+            local idx_text, name = line:match("%[(%d+)%]%s*(.+)")
+            if idx_text then
+                local idx = tonumber(idx_text)
+                if idx then
+                    if first_index == nil then
+                        first_index = idx
+                    end
+                    local name_lower = string.lower(name or "")
+                    if preferred_index == nil and (
+                        name_lower:find("microphone", 1, true)
+                        or name_lower:find("mic", 1, true)
+                        or name_lower:find("input", 1, true)
+                        or name_lower:find("headset", 1, true)
+                        or name_lower:find("airpods", 1, true)
+                    ) then
+                        preferred_index = idx
+                    end
+                end
+            end
+        end
+    end
+
+    if preferred_index ~= nil then
+        macos_audio_input_index_cache = preferred_index
+    elseif first_index ~= nil then
+        macos_audio_input_index_cache = first_index
+    else
+        if not ok and ffmpeg_error == nil then
+            ffmpeg_error = "Could not list macOS audio inputs; defaulting to index 0."
+        end
+        macos_audio_input_index_cache = 0
+    end
+    return macos_audio_input_index_cache
+end
+
+local function process_is_alive(pid)
+    if not pid then
+        return false
+    end
+    local _, os_lower = get_os_details()
+    if is_windows_os(os_lower) then
+        return false
+    end
+    local ok = run_shell_command(string.format("kill -0 %d", pid), 1000, false)
+    return ok and true or false
+end
+
+local function record_voice_command(seconds)
+    if not detect_ffmpeg() then
+        return nil, ffmpeg_error or ("Recording requires ffmpeg at: " .. FFMPEG)
+    end
+
+    local output_path = make_temp_path("voice_cmd", "wav")
+    local duration = tonumber(seconds) or 5
+    local os_name, os_lower = get_os_details()
+
+    local record_cmd
+    if is_macos_os(os_lower) then
+        local audio_index = detect_macos_audio_input_index()
+        record_cmd = string.format(
+            "%s -hide_banner -loglevel error -y -f avfoundation -i %s -t %.2f -ac 1 -ar 16000 %s",
+            shell_quote(FFMPEG),
+            shell_quote(":" .. tostring(audio_index)),
+            duration,
+            shell_quote(output_path)
+        )
+    elseif is_windows_os(os_lower) then
+        record_cmd = string.format(
+            "%s -hide_banner -loglevel error -y -f dshow -i %s -t %.2f -ac 1 -ar 16000 %s",
+            shell_quote(FFMPEG),
+            shell_quote("audio=default"),
+            duration,
+            shell_quote(output_path)
+        )
+    else
+        record_cmd = string.format(
+            "%s -hide_banner -loglevel error -y -f pulse -i %s -t %.2f -ac 1 -ar 16000 %s",
+            shell_quote(FFMPEG),
+            shell_quote("default"),
+            duration,
+            shell_quote(output_path)
+        )
+    end
+
+    local ok, _, err = run_shell_command(record_cmd, 25000, false)
+    if not ok or not file_exists(output_path) then
+        if file_exists(output_path) then
+            os.remove(output_path)
+        end
+        local message = "Failed to record voice command."
+        if is_macos_os(os_lower) then
+            message = message .. "\nOn macOS, check: Settings -> Privacy & Security -> Microphone -> REAPER."
+        end
+        if os_name ~= "" then
+            message = message .. "\nDetected OS: " .. os_name
+        end
+        if err and err ~= "" then
+            message = message .. "\n" .. err
+        end
+        return nil, message
+    end
+    return output_path, nil
+end
+
+local function run_stt(audio_path)
+    local output_json_path = make_temp_json_path("speech_stt_output")
+    local ok, _, err = run_python_script("reaper_py/speech_bridge.py", {"stt", audio_path, output_json_path}, 45000)
+    local output_text = read_file(output_json_path)
+    os.remove(output_json_path)
+    os.remove(audio_path)
+
+    if not ok and (not output_text or output_text == "") then
+        return nil, "STT bridge failed." .. ((err and err ~= "") and ("\n" .. err) or "")
+    end
+    if not output_text or output_text == "" then
+        return nil, "STT bridge returned no output."
+    end
+
+    local parsed_ok, parsed_or_err = pcall(json_decode, output_text)
+    if not parsed_ok or type(parsed_or_err) ~= "table" then
+        return nil, "Invalid STT bridge JSON."
+    end
+    if not parsed_or_err.ok then
+        return nil, tostring(parsed_or_err.error or "STT failed.")
+    end
+    local text = trim(parsed_or_err.text or "")
+    if text == "" then
+        return nil, "Transcription was empty."
+    end
+    return text, nil
+end
+
+local function run_tts(text, voice_override)
+    local spoken_text = trim(text)
+    if spoken_text == "" then
+        return nil, "Nothing to speak."
+    end
+
+    local input_text_path = make_temp_path("speech_tts_input", "txt")
+    local output_mp3_path = make_temp_path("speech_tts_output", "mp3")
+    if not write_file(input_text_path, spoken_text) then
+        return nil, "Failed to write TTS input file."
+    end
+
+    local args = {"tts", input_text_path, output_mp3_path}
+    if voice_override and trim(voice_override) ~= "" then
+        args[#args + 1] = trim(voice_override)
+    end
+
+    local ok, _, err = run_python_script("reaper_py/speech_bridge.py", args, 30000)
+    os.remove(input_text_path)
+    if not ok or not file_exists(output_mp3_path) then
+        if file_exists(output_mp3_path) then
+            os.remove(output_mp3_path)
+        end
+        local detail = trim(tostring(err or "")):match("^[^\r\n]+")
+        if detail and detail ~= "" then
+            return nil, "TTS synthesis failed. " .. detail
+        end
+        return nil, "TTS synthesis failed."
+    end
+    return output_mp3_path, nil
+end
+
+local function play_tts_file(audio_path)
+    local _, os_lower = get_os_details()
+    local ok, _, err
+
+    if is_macos_os(os_lower) then
+        local player = file_exists(AFPLAY) and AFPLAY or "afplay"
+        local payload = string.format("%s %s > /dev/null 2>&1 &", shell_quote(player), shell_quote(audio_path))
+        local launch_cmd = string.format("/bin/zsh -lc %s", shell_single_quote(payload))
+        local exit_code, output = reaper.ExecProcess(launch_cmd, 5000)
+        ok = tonumber(exit_code) == 0
+        err = ok and nil or tostring(output or "")
+    elseif is_windows_os(os_lower) then
+        ok, _, err = run_shell_command(string.format("cmd /c start \"\" %s", shell_quote(audio_path)), 20000)
+    else
+        ok, _, err = run_shell_command(string.format("xdg-open %s", shell_quote(audio_path)), 20000)
+    end
+
+    if not ok then
+        local brief = trim(tostring(err or "")):match("^[^\r\n]+")
+        if brief and brief ~= "" then
+            return "Saved speech to: " .. audio_path .. " (auto-play failed: " .. brief .. ")"
+        end
+        return "Saved speech to: " .. audio_path .. " (auto-play failed)."
+    end
+    return nil
 end
 
 local function question_is_target_choice(question)
@@ -1297,11 +1682,9 @@ local function run_command_flow(command, target, from_followup)
             return
         end
 
-        pending_plan = nil
         pending_question = normalize_text(response.clarification_question or "Please clarify your command.")
         forced_target = nil
         clarification_attempted = false
-        last_preview = pending_question
 
         local seed_intent = infer_intent_from_command(normalized_command)
         pending_intent = {
@@ -1324,31 +1707,43 @@ local function run_command_flow(command, target, from_followup)
     pending_intent = nil
     forced_target = nil
     clarification_attempted = false
-    last_preview = preview_text
     last_error = nil
+    speech_error = nil
     last_user_intent = infer_intent_from_tool_calls(normalized_command, tool_calls, target)
 
-    if quick_apply then
-        local ran_count = execute_tool_calls_now(tool_calls)
-        local ran_summary = first_preview_action(preview_text)
-        append_history("system", "Ran: " .. ran_summary, true)
-        if show_preview then
-            append_history("system", preview_text, true)
-        end
-        pending_plan = nil
-        set_status(string.format("Ran %d action(s)", ran_count))
+    local ran_count = execute_tool_calls_now(tool_calls)
+    local ran_summary = first_preview_action(preview_text)
+    local ran_message = "Ran: " .. ran_summary
+    append_history("system", ran_message, true)
+    speech_last_response = ran_message
+    set_status(string.format("Ran %d action(s)", ran_count))
+end
+
+local function maybe_speak_feedback(text)
+    local spoken_text = trim(text)
+    if not speak_after_run or spoken_text == "" then
         return
     end
 
-    pending_plan = {
-        tool_calls = tool_calls,
-        preview = preview_text,
-    }
-    append_history("system", preview_text, show_preview or verbose_history)
-    set_status(string.format("Ready to apply %d action(s)", #tool_calls))
+    local mp3_path, tts_error = run_tts(spoken_text, speech_voice_override)
+    if not mp3_path then
+        speech_error = normalize_text(tts_error or "TTS failed.")
+        speech_status_line = "Error: " .. speech_error
+        append_history("system", "Error: " .. speech_error, true)
+        set_status("Error: " .. speech_error)
+        return
+    end
+
+    local play_error = play_tts_file(mp3_path)
+    if play_error then
+        speech_error = normalize_text(play_error)
+        speech_status_line = "Saved speech file (auto-play failed)."
+        return
+    end
+    speech_status_line = "Spoken feedback played."
 end
 
-local function submit_user_command(raw_input)
+local function submit_user_command(raw_input, source_tag)
     local user_input = trim(raw_input)
     if user_input == "" then
         last_error = "Enter a command first."
@@ -1356,7 +1751,8 @@ local function submit_user_command(raw_input)
         return
     end
 
-    append_history("user", user_input, true)
+    local user_role = source_tag == "voice" and "user_voice" or "user"
+    append_history(user_role, user_input, true)
 
     local allow_plain_number = pending_intent ~= nil or (last_user_intent and last_user_intent.expects_number)
     local parameter_only = is_parameter_only_input(user_input, allow_plain_number)
@@ -1374,6 +1770,9 @@ local function submit_user_command(raw_input)
             pending_intent.attempted = true
             local combined = pending_intent.original_cmd .. " " .. user_input
             run_command_flow(combined, pending_intent.forced_target, true)
+            if not pending_question and not last_error then
+                maybe_speak_feedback(speech_last_response)
+            end
             return
         end
 
@@ -1387,39 +1786,48 @@ local function submit_user_command(raw_input)
     if parameter_only and last_user_intent and last_user_intent.expects_number then
         local combined = build_followup_command(last_user_intent, user_input)
         run_command_flow(combined, last_user_intent.forced_target, true)
+        if not pending_question and not last_error then
+            maybe_speak_feedback(speech_last_response)
+        end
         return
     end
 
     run_command_flow(user_input, nil, false)
-end
-
-local function apply_pending_plan()
-    if quick_apply then
-        return
+    if not pending_question and not last_error then
+        maybe_speak_feedback(speech_last_response)
     end
-    if not pending_plan or not pending_plan.tool_calls or #pending_plan.tool_calls == 0 then
-        return
-    end
-
-    local ran_count = execute_tool_calls_now(pending_plan.tool_calls)
-    append_history("system", "Ran: " .. first_preview_action(pending_plan.preview), true)
-    set_status(string.format("Ran %d action(s)", ran_count))
-    pending_plan = nil
 end
 
 local function draw_history(history_height)
-    if begin_child_compat("History", -1, history_height, true) then
+    local child_started, child_visible = begin_child_compat("History", -1, history_height, true)
+    if child_started then
         local ok, err = pcall(function()
-            for i = 1, #history do
-                local entry = history[i]
-                local prefix = entry.role == "user" and "You" or "Cursor"
-                reaper.ImGui_TextWrapped(imgui_ctx, prefix .. ": " .. entry.text)
-                if i < #history then
-                    reaper.ImGui_Separator(imgui_ctx)
+            if child_visible then
+                local user_at_bottom = true
+                if reaper.ImGui_GetScrollY and reaper.ImGui_GetScrollMaxY then
+                    local start_scroll_y = reaper.ImGui_GetScrollY(imgui_ctx)
+                    local start_scroll_max = reaper.ImGui_GetScrollMaxY(imgui_ctx)
+                    user_at_bottom = (start_scroll_max - start_scroll_y) < 24
                 end
-            end
-            if scroll_history_to_bottom then
-                reaper.ImGui_SetScrollHereY(imgui_ctx, 1.0)
+
+                for i = 1, #history do
+                    local entry = history[i]
+                    local prefix = "Cursor"
+                    if entry.role == "user" then
+                        prefix = "You"
+                    elseif entry.role == "user_voice" then
+                        prefix = "You (voice)"
+                    end
+                    reaper.ImGui_TextWrapped(imgui_ctx, prefix .. ": " .. entry.text)
+                    if i < #history then
+                        reaper.ImGui_Separator(imgui_ctx)
+                    end
+                end
+
+                local should_scroll = scroll_history_to_bottom and user_at_bottom
+                if should_scroll then
+                    reaper.ImGui_SetScrollHereY(imgui_ctx, 1.0)
+                end
                 scroll_history_to_bottom = false
             end
         end)
@@ -1436,49 +1844,19 @@ local function draw_header(current_ctx)
     local track_count = #current_ctx.selected_tracks
     local has_time = current_ctx.time_selection ~= nil and "yes" or "no"
 
-    reaper.ImGui_Text(imgui_ctx, string.format("Selected clips: %d", clip_count))
-    reaper.ImGui_SameLine(imgui_ctx)
-    reaper.ImGui_Text(imgui_ctx, string.format("Selected tracks: %d", track_count))
-    reaper.ImGui_SameLine(imgui_ctx)
-    reaper.ImGui_Text(imgui_ctx, "Time selection: " .. has_time)
-    reaper.ImGui_SameLine(imgui_ctx)
-    reaper.ImGui_Text(imgui_ctx, "Cursor: " .. format_time(current_ctx.cursor))
+    reaper.ImGui_TextWrapped(
+        imgui_ctx,
+        string.format(
+            "Selected clips: %d | Selected tracks: %d | Time selection: %s | Cursor: %s",
+            clip_count,
+            track_count,
+            has_time,
+            format_time(current_ctx.cursor)
+        )
+    )
 
     reaper.ImGui_Separator(imgui_ctx)
-
-    local changed_quick
-    changed_quick, quick_apply = checkbox_compat("Quick Apply", quick_apply)
-    if changed_quick and quick_apply and show_preview then
-        -- Keep preview optional in quick mode, defaulting to off.
-        show_preview = false
-    end
-
-    reaper.ImGui_SameLine(imgui_ctx)
-    local _, next_show_preview = checkbox_compat("Show Preview", show_preview)
-    show_preview = next_show_preview
-
-    reaper.ImGui_SameLine(imgui_ctx)
-    local _, next_verbose = checkbox_compat("Verbose History", verbose_history)
-    verbose_history = next_verbose
-
-    if not quick_apply then
-        reaper.ImGui_SameLine(imgui_ctx)
-        local can_apply = pending_plan and pending_plan.tool_calls and #pending_plan.tool_calls > 0
-        if reaper.ImGui_BeginDisabled and reaper.ImGui_EndDisabled then
-            reaper.ImGui_BeginDisabled(imgui_ctx, not can_apply)
-            if reaper.ImGui_Button(imgui_ctx, "Apply") then
-                apply_pending_plan()
-            end
-            reaper.ImGui_EndDisabled(imgui_ctx)
-        elseif can_apply and reaper.ImGui_Button(imgui_ctx, "Apply") then
-            apply_pending_plan()
-        else
-            reaper.ImGui_Button(imgui_ctx, "Apply")
-        end
-    end
-
-    reaper.ImGui_Separator(imgui_ctx)
-    local status_text = is_planning and "Planning..." or status_line
+    local status_text = is_planning and "Thinking..." or status_line
     reaper.ImGui_TextWrapped(imgui_ctx, "Status: " .. status_text)
 
     if show_dock_hint then
@@ -1498,9 +1876,8 @@ local function draw_pending_question()
     end
 
     reaper.ImGui_Separator(imgui_ctx)
-    reaper.ImGui_TextWrapped(imgui_ctx, pending_question)
-
     if question_is_target_choice(pending_question) then
+        reaper.ImGui_TextWrapped(imgui_ctx, pending_question)
         if reaper.ImGui_Button(imgui_ctx, "Apply to Clip(s)") then
             if clarification_attempted then
                 last_error = "Clarification already used. Try one complete command."
@@ -1513,6 +1890,9 @@ local function draw_pending_question()
                 forced_target = "clips"
                 pending_intent.forced_target = "clips"
                 run_command_flow(pending_intent.original_cmd, "clips", true)
+                if not pending_question and not last_error then
+                    maybe_speak_feedback(speech_last_response)
+                end
             end
         end
 
@@ -1529,39 +1909,17 @@ local function draw_pending_question()
                 forced_target = "tracks"
                 pending_intent.forced_target = "tracks"
                 run_command_flow(pending_intent.original_cmd, "tracks", true)
+                if not pending_question and not last_error then
+                    maybe_speak_feedback(speech_last_response)
+                end
             end
         end
+    else
+        reaper.ImGui_TextWrapped(imgui_ctx, pending_question)
     end
-end
-
-local function draw_preview_block()
-    reaper.ImGui_Separator(imgui_ctx)
-    reaper.ImGui_Text(imgui_ctx, "Preview")
-    if begin_child_compat("PreviewArea", -1, 120, true) then
-        local ok, err = pcall(function()
-            local pushed = push_mono_font_if_available()
-            reaper.ImGui_TextWrapped(imgui_ctx, normalize_text(last_preview or "No preview yet."))
-            pop_mono_font_if_pushed(pushed)
-        end)
-        if not ok then
-            last_error = "UI preview render error: " .. tostring(err)
-            set_status("Error: UI preview render error")
-        end
-        reaper.ImGui_EndChild(imgui_ctx)
-    end
-end
-
-local function draw_error_block()
-    if not last_error or trim(last_error) == "" then
-        return
-    end
-    reaper.ImGui_Separator(imgui_ctx)
-    reaper.ImGui_TextWrapped(imgui_ctx, "Error: " .. normalize_text(last_error))
 end
 
 local function draw_input_bar()
-    reaper.ImGui_Separator(imgui_ctx)
-    local run_label = quick_apply and "Run" or "Send"
     local run_width = 70
     local clear_width = 60
     local spacing = 12
@@ -1578,8 +1936,8 @@ local function draw_input_bar()
     enter_pressed, command_input = reaper.ImGui_InputText(imgui_ctx, "##CommandInput", command_input, enter_flag)
 
     reaper.ImGui_SameLine(imgui_ctx)
-    if reaper.ImGui_Button(imgui_ctx, run_label) then
-        submit_user_command(command_input)
+    if reaper.ImGui_Button(imgui_ctx, "Run") then
+        submit_user_command(command_input, "text")
         command_input = ""
     end
 
@@ -1589,8 +1947,409 @@ local function draw_input_bar()
     end
 
     if enter_pressed then
-        submit_user_command(command_input)
+        submit_user_command(command_input, "text")
         command_input = ""
+    end
+end
+
+local function process_recorded_voice_audio(audio_path)
+    speech_status_line = "Transcribing..."
+    set_status("Transcribing...")
+    local transcript, stt_error = run_stt(audio_path)
+    if not transcript then
+        speech_error = normalize_text(stt_error or "Transcription failed.")
+        speech_status_line = "Error: " .. speech_error
+        append_history("system", "Error: " .. speech_error, true)
+        set_status("Error: " .. speech_error)
+        return
+    end
+
+    speech_status_line = "Transcribed."
+    submit_user_command(transcript, "voice")
+    if not last_error and not pending_question then
+        speech_status_line = "Ran voice command."
+    end
+end
+
+local function stop_voice_recording(manual_stop)
+    if not speech_recording_active then
+        return
+    end
+
+    local audio_path = speech_recording_audio_path
+    local pid_path = speech_recording_pid_path
+    local log_path = speech_recording_log_path
+    local _, os_lower = get_os_details()
+    local pid = nil
+
+    speech_recording_active = false
+    speech_recording_started_at = 0
+    speech_recording_duration = 0
+    speech_recording_audio_path = nil
+    speech_recording_pid_path = nil
+    speech_recording_log_path = nil
+
+    if pid_path then
+        pid = read_pid_from_file(pid_path)
+        if pid and manual_stop and not is_windows_os(os_lower) then
+            run_shell_command(string.format("kill -INT %d", pid), 3000, false)
+        end
+        os.remove(pid_path)
+    end
+
+    local deadline = reaper.time_precise() + (manual_stop and 1.5 or 1.1)
+    while reaper.time_precise() < deadline do
+        local alive = pid and process_is_alive(pid) or false
+        if audio_path and file_exists(audio_path) then
+            local current_size = file_size(audio_path)
+            if current_size and current_size > 0 and not alive then
+                break
+            end
+        elseif not alive then
+            break
+        end
+    end
+
+    if pid and process_is_alive(pid) and not is_windows_os(os_lower) then
+        run_shell_command(string.format("kill -TERM %d", pid), 2000, false)
+    end
+
+    if not audio_path or not file_exists(audio_path) then
+        local message = "No recorded audio file was produced."
+        if is_macos_os(os_lower) then
+            message = message .. "\nOn macOS, check: Settings -> Privacy & Security -> Microphone -> REAPER."
+        end
+        if log_path and file_exists(log_path) then
+            local log_text = trim(read_file(log_path) or "")
+            if log_text ~= "" then
+                message = message .. "\nRecorder log:\n" .. log_text
+            end
+            os.remove(log_path)
+        end
+        speech_error = normalize_text(message)
+        speech_status_line = "Error: " .. speech_error
+        append_history("system", "Error: " .. speech_error, true)
+        set_status("Error: " .. speech_error)
+        return
+    end
+
+    local size = file_size(audio_path)
+    if size and size < 256 then
+        os.remove(audio_path)
+        local message = "Recorded audio was empty. Try again and speak louder."
+        if log_path and file_exists(log_path) then
+            local log_text = trim(read_file(log_path) or "")
+            if log_text ~= "" then
+                message = message .. "\nRecorder log:\n" .. log_text
+            end
+            os.remove(log_path)
+        end
+        speech_error = message
+        speech_status_line = "Error: " .. speech_error
+        append_history("system", "Error: " .. speech_error, true)
+        set_status("Error: " .. speech_error)
+        return
+    end
+
+    if log_path and file_exists(log_path) then
+        os.remove(log_path)
+    end
+
+    process_recorded_voice_audio(audio_path)
+end
+
+local function start_voice_recording_async(duration)
+    local output_path = make_temp_path("voice_cmd", "wav")
+    local pid_path = make_temp_path("voice_cmd_pid", "txt")
+    local log_path = make_temp_path("voice_cmd_log", "txt")
+    os.remove(output_path)
+    os.remove(pid_path)
+    os.remove(log_path)
+
+    local _, os_lower = get_os_details()
+    local record_cmd
+    if is_macos_os(os_lower) then
+        local audio_index = detect_macos_audio_input_index()
+        record_cmd = string.format(
+            "%s -hide_banner -loglevel error -y -f avfoundation -i %s -t %.2f -ac 1 -ar 16000 %s",
+            shell_quote(FFMPEG),
+            shell_quote(":" .. tostring(audio_index)),
+            duration,
+            shell_quote(output_path)
+        )
+    elseif is_windows_os(os_lower) then
+        -- Windows fallback remains synchronous.
+        return record_voice_command(duration)
+    else
+        record_cmd = string.format(
+            "%s -hide_banner -loglevel error -y -f pulse -i %s -t %.2f -ac 1 -ar 16000 %s",
+            shell_quote(FFMPEG),
+            shell_quote("default"),
+            duration,
+            shell_quote(output_path)
+        )
+    end
+
+    local background_cmd = string.format("%s > %s 2>&1 & echo $! > %s", record_cmd, shell_quote(log_path), shell_quote(pid_path))
+    local quoted_background_cmd = shell_single_quote(background_cmd)
+    local launch_attempts = {}
+    if file_exists("/bin/zsh") then
+        launch_attempts[#launch_attempts + 1] = string.format("/bin/zsh -lc %s", quoted_background_cmd)
+    end
+    if file_exists("/bin/sh") then
+        launch_attempts[#launch_attempts + 1] = string.format("/bin/sh -c %s", quoted_background_cmd)
+    end
+    if #launch_attempts == 0 then
+        launch_attempts[1] = background_cmd
+    end
+
+    local diagnostics = {}
+    local launched = false
+    for i = 1, #launch_attempts do
+        local launch_cmd = launch_attempts[i]
+        local exit_code, output = reaper.ExecProcess(launch_cmd, 5000)
+        if tonumber(exit_code) == 0 then
+            local pid_deadline = reaper.time_precise() + 0.5
+            while reaper.time_precise() < pid_deadline do
+                local pid = read_pid_from_file(pid_path)
+                if pid and pid > 0 then
+                    launched = true
+                    break
+                end
+            end
+            if launched then
+                break
+            end
+            diagnostics[#diagnostics + 1] = string.format("[attempt %d] command exited 0 but pid was not created", i)
+        else
+            diagnostics[#diagnostics + 1] = string.format(
+                "[attempt %d exit=%s] %s",
+                i,
+                tostring(exit_code),
+                tostring(output or "")
+            )
+        end
+    end
+
+    if not launched then
+        local err = table.concat(diagnostics, "\n")
+        local log_text = trim(read_file(log_path) or "")
+        os.remove(pid_path)
+        os.remove(output_path)
+        os.remove(log_path)
+        local message = "Failed to start recording process."
+        if err ~= "" then
+            message = message .. "\n" .. err
+        end
+        if log_text ~= "" then
+            message = message .. "\nRecorder log:\n" .. log_text
+        end
+        return nil, message
+    end
+
+    speech_recording_active = true
+    speech_recording_started_at = reaper.time_precise()
+    speech_recording_duration = duration
+    speech_recording_audio_path = output_path
+    speech_recording_pid_path = pid_path
+    speech_recording_log_path = log_path
+    return output_path, nil
+end
+
+local function update_recording_progress()
+    if not speech_recording_active then
+        return
+    end
+
+    local elapsed = reaper.time_precise() - (speech_recording_started_at or 0)
+    if elapsed < 0 then
+        elapsed = 0
+    end
+    local shown = math.min(elapsed, speech_recording_duration)
+    speech_status_line = string.format("Recording... %.1fs / %.1fs", shown, speech_recording_duration)
+
+    if elapsed >= speech_recording_duration then
+        stop_voice_recording(false)
+    end
+end
+
+local function run_voice_command()
+    if speech_recording_active then
+        return
+    end
+
+    local duration = tonumber(stt_duration_options[stt_duration_index]) or 5
+    speech_error = nil
+    set_status("Recording voice command...")
+
+    local _, os_lower = get_os_details()
+    if is_windows_os(os_lower) then
+        speech_status_line = "Recording..."
+        local audio_path, record_error = record_voice_command(duration)
+        if not audio_path then
+            speech_error = normalize_text(record_error or "Recording failed.")
+            speech_status_line = "Error: " .. speech_error
+            append_history("system", "Error: " .. speech_error, true)
+            set_status("Error: " .. speech_error)
+            return
+        end
+        process_recorded_voice_audio(audio_path)
+        return
+    end
+
+    local _, start_error = start_voice_recording_async(duration)
+    if start_error then
+        speech_error = normalize_text(start_error)
+        speech_status_line = "Error: " .. speech_error
+        append_history("system", "Error: " .. speech_error, true)
+        set_status("Error: " .. speech_error)
+        return
+    end
+
+    speech_status_line = string.format("Recording... 0.0s / %.1fs", duration)
+end
+
+local function speak_last_response_now()
+    local text = trim(speech_last_response)
+    if text == "" then
+        speech_error = "No response available to speak yet."
+        speech_status_line = "Error: " .. speech_error
+        set_status("Error: " .. speech_error)
+        return
+    end
+
+    speech_error = nil
+    speech_status_line = "Synthesizing..."
+    local mp3_path, tts_error = run_tts(text, speech_voice_override)
+    if not mp3_path then
+        speech_error = normalize_text(tts_error or "TTS failed.")
+        speech_status_line = "Error: " .. speech_error
+        append_history("system", "Error: " .. speech_error, true)
+        set_status("Error: " .. speech_error)
+        return
+    end
+
+    local play_error = play_tts_file(mp3_path)
+    if play_error then
+        speech_error = normalize_text(play_error)
+        speech_status_line = "Saved speech file (auto-play failed)."
+        return
+    end
+    speech_status_line = "Played last response."
+end
+
+local function draw_commands_tab()
+    local available_height = select(2, reaper.ImGui_GetContentRegionAvail(imgui_ctx))
+    available_height = tonumber(available_height) or 520
+    local history_height = math.max(120, available_height - 110)
+    draw_history(history_height)
+    draw_pending_question()
+    reaper.ImGui_Separator(imgui_ctx)
+    draw_input_bar()
+end
+
+local function draw_speech_tab()
+    reaper.ImGui_Text(imgui_ctx, "Voice command")
+    reaper.ImGui_Separator(imgui_ctx)
+
+    if detect_ffmpeg() then
+        reaper.ImGui_TextWrapped(imgui_ctx, "Record a short command and run it through the same Gemini command pipeline.")
+    else
+        reaper.ImGui_TextWrapped(imgui_ctx, "Recording requires ffmpeg at: " .. FFMPEG)
+    end
+
+    reaper.ImGui_Text(imgui_ctx, "Recording length")
+    reaper.ImGui_SameLine(imgui_ctx)
+    if reaper.ImGui_BeginDisabled and reaper.ImGui_EndDisabled then
+        reaper.ImGui_BeginDisabled(imgui_ctx, speech_recording_active)
+        if reaper.ImGui_BeginCombo and reaper.ImGui_EndCombo then
+            local current_label = tostring(stt_duration_options[stt_duration_index] or 5) .. "s"
+            if reaper.ImGui_BeginCombo(imgui_ctx, "##stt_duration", current_label) then
+                for i = 1, #stt_duration_options do
+                    local label = tostring(stt_duration_options[i]) .. "s"
+                    local selected = i == stt_duration_index
+                    if reaper.ImGui_Selectable(imgui_ctx, label, selected) then
+                        stt_duration_index = i
+                    end
+                    if selected and reaper.ImGui_SetItemDefaultFocus then
+                        reaper.ImGui_SetItemDefaultFocus(imgui_ctx)
+                    end
+                end
+                reaper.ImGui_EndCombo(imgui_ctx)
+            end
+        end
+        reaper.ImGui_EndDisabled(imgui_ctx)
+    end
+
+    local _, speech_os_lower = get_os_details()
+    if is_macos_os(speech_os_lower) then
+        reaper.ImGui_TextWrapped(imgui_ctx, "Audio input index (macOS, optional)")
+        if reaper.ImGui_SetNextItemWidth then
+            reaper.ImGui_SetNextItemWidth(imgui_ctx, 120)
+        end
+        local changed_input_idx, next_input_idx = reaper.ImGui_InputText(imgui_ctx, "##speech_input_index", speech_audio_device_override)
+        if changed_input_idx then
+            speech_audio_device_override = trim(next_input_idx or "")
+            macos_audio_input_index_cache = nil
+        end
+        local selected_index = detect_macos_audio_input_index()
+        reaper.ImGui_SameLine(imgui_ctx)
+        reaper.ImGui_Text(imgui_ctx, "Using: " .. tostring(selected_index))
+    end
+
+    if speech_recording_active then
+        reaper.ImGui_TextWrapped(imgui_ctx, "Recording now...")
+    end
+
+    local record_disabled = (not detect_ffmpeg()) or speech_recording_active
+    if speech_recording_active then
+        if reaper.ImGui_Button(imgui_ctx, "Stop Recording") then
+            stop_voice_recording(true)
+        end
+    else
+        if reaper.ImGui_BeginDisabled and reaper.ImGui_EndDisabled then
+            reaper.ImGui_BeginDisabled(imgui_ctx, record_disabled)
+            if reaper.ImGui_Button(imgui_ctx, "Start Recording") then
+                run_voice_command()
+            end
+            reaper.ImGui_EndDisabled(imgui_ctx)
+        elseif not record_disabled then
+            if reaper.ImGui_Button(imgui_ctx, "Start Recording") then
+                run_voice_command()
+            end
+        else
+            reaper.ImGui_Button(imgui_ctx, "Start Recording")
+        end
+    end
+
+    reaper.ImGui_TextWrapped(imgui_ctx, "Speech status: " .. speech_status_line)
+
+    reaper.ImGui_Separator(imgui_ctx)
+    reaper.ImGui_Text(imgui_ctx, "Spoken feedback")
+    local _, next_speak = checkbox_compat("Speak after running a command", speak_after_run)
+    speak_after_run = next_speak
+
+    if reaper.ImGui_Button(imgui_ctx, "Speak last response") then
+        speak_last_response_now()
+    end
+
+    local env_voice_id = trim(os.getenv("ELEVENLABS_VOICE_ID") or "")
+    if env_voice_id == "" then
+        env_voice_id = "(not set, will auto-discover)"
+    end
+    reaper.ImGui_TextWrapped(imgui_ctx, "Default voice ID: " .. env_voice_id)
+    reaper.ImGui_TextWrapped(imgui_ctx, "Voice ID override (optional)")
+    if reaper.ImGui_SetNextItemWidth then
+        reaper.ImGui_SetNextItemWidth(imgui_ctx, -1)
+    end
+    local changed, next_voice = reaper.ImGui_InputText(imgui_ctx, "##voice_override", speech_voice_override)
+    if changed then
+        speech_voice_override = next_voice
+    end
+
+    if speech_error and trim(speech_error) ~= "" then
+        reaper.ImGui_Separator(imgui_ctx)
+        reaper.ImGui_TextWrapped(imgui_ctx, "Speech error: " .. speech_error)
     end
 end
 
@@ -1611,15 +2370,29 @@ local function draw_ui()
 
     local current_ctx = collect_context()
     draw_header(current_ctx)
+    reaper.ImGui_Separator(imgui_ctx)
 
-    local available_height = select(2, reaper.ImGui_GetContentRegionAvail(imgui_ctx))
-    available_height = tonumber(available_height) or 520
-    local history_height = math.max(120, available_height - 320)
-    draw_history(history_height)
-    draw_pending_question()
-    draw_preview_block()
-    draw_error_block()
-    draw_input_bar()
+    local drew_tabs = false
+    if reaper.ImGui_BeginTabBar and reaper.ImGui_EndTabBar and reaper.ImGui_BeginTabItem and reaper.ImGui_EndTabItem then
+        if reaper.ImGui_BeginTabBar(imgui_ctx, "CursorTabs") then
+            drew_tabs = true
+            if reaper.ImGui_BeginTabItem(imgui_ctx, "Commands") then
+                draw_commands_tab()
+                reaper.ImGui_EndTabItem(imgui_ctx)
+            end
+            if reaper.ImGui_BeginTabItem(imgui_ctx, "Speech") then
+                draw_speech_tab()
+                reaper.ImGui_EndTabItem(imgui_ctx)
+            end
+            reaper.ImGui_EndTabBar(imgui_ctx)
+        end
+    end
+
+    if not drew_tabs then
+        draw_commands_tab()
+        reaper.ImGui_Separator(imgui_ctx)
+        draw_speech_tab()
+    end
 
     if reaper.ImGui_PopStyleVar and pushed_style > 0 then
         reaper.ImGui_PopStyleVar(imgui_ctx, pushed_style)
@@ -1630,6 +2403,8 @@ local function loop()
     if not imgui_ctx then
         return
     end
+
+    update_recording_progress()
 
     local ok, open_or_err = pcall(function()
         local cond_first = reaper.ImGui_Cond_FirstUseEver and reaper.ImGui_Cond_FirstUseEver() or 0
