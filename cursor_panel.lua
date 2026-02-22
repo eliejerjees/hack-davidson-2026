@@ -13,7 +13,44 @@ end
 math.randomseed(os.time())
 
 local WINDOW_TITLE = "Cursor for DAWs"
-local imgui_ctx = reaper.ImGui_CreateContext(WINDOW_TITLE)
+local EXTSTATE_SECTION = "CursorForDAWsPanel"
+local EXTSTATE_DOCK_HINT_KEY = "dock_hint_dismissed"
+local EXTSTATE_AUTODOCK_KEY = "autodock_attempted"
+
+local function get_extstate(key, default_value)
+    if reaper.GetExtState then
+        local value = reaper.GetExtState(EXTSTATE_SECTION, key)
+        if value and value ~= "" then
+            return value
+        end
+    end
+    return default_value
+end
+
+local function set_extstate(key, value)
+    if reaper.SetExtState then
+        reaper.SetExtState(EXTSTATE_SECTION, key, tostring(value), true)
+    end
+end
+
+local context_flags = 0
+if reaper.ImGui_ConfigFlags_DockingEnable then
+    local ok_flag, docking_flag = pcall(reaper.ImGui_ConfigFlags_DockingEnable)
+    if ok_flag and type(docking_flag) == "number" then
+        context_flags = context_flags + docking_flag
+    end
+end
+
+local imgui_ctx = nil
+if context_flags ~= 0 then
+    local ok_ctx, ctx = pcall(reaper.ImGui_CreateContext, WINDOW_TITLE, context_flags)
+    if ok_ctx and ctx then
+        imgui_ctx = ctx
+    end
+end
+if not imgui_ctx then
+    imgui_ctx = reaper.ImGui_CreateContext(WINDOW_TITLE)
+end
 
 local history = {}
 local command_input = ""
@@ -31,6 +68,8 @@ local quick_apply = true
 local show_preview = false
 local verbose_history = false
 local scroll_history_to_bottom = false
+local show_dock_hint = get_extstate(EXTSTATE_DOCK_HINT_KEY, "0") ~= "1"
+local autodock_pending = get_extstate(EXTSTATE_AUTODOCK_KEY, "0") ~= "1"
 
 local mono_font = nil
 -- Disabled by default for wide ReaImGui compatibility across versions.
@@ -1441,6 +1480,16 @@ local function draw_header(current_ctx)
     reaper.ImGui_Separator(imgui_ctx)
     local status_text = is_planning and "Planning..." or status_line
     reaper.ImGui_TextWrapped(imgui_ctx, "Status: " .. status_text)
+
+    if show_dock_hint then
+        reaper.ImGui_Separator(imgui_ctx)
+        reaper.ImGui_TextWrapped(imgui_ctx, "Tip: drag this tab to REAPER's right docker to dock it as a sidebar.")
+        reaper.ImGui_SameLine(imgui_ctx)
+        if reaper.ImGui_Button(imgui_ctx, "Dismiss") then
+            show_dock_hint = false
+            set_extstate(EXTSTATE_DOCK_HINT_KEY, "1")
+        end
+    end
 end
 
 local function draw_pending_question()
@@ -1584,8 +1633,22 @@ local function loop()
 
     local ok, open_or_err = pcall(function()
         local cond_first = reaper.ImGui_Cond_FirstUseEver and reaper.ImGui_Cond_FirstUseEver() or 0
-        reaper.ImGui_SetNextWindowSize(imgui_ctx, 560, 820, cond_first)
+        reaper.ImGui_SetNextWindowSize(imgui_ctx, 420, 820, cond_first)
         reaper.ImGui_SetNextWindowPos(imgui_ctx, 1040, 40, cond_first)
+
+        if autodock_pending then
+            autodock_pending = false
+            set_extstate(EXTSTATE_AUTODOCK_KEY, "1")
+
+            -- Best-effort auto-dock attempt. On most setups this will still require
+            -- dragging the tab into REAPER's right docker once.
+            if reaper.ImGui_SetNextWindowDockID and reaper.ImGui_GetID then
+                local ok_id, dock_id = pcall(reaper.ImGui_GetID, imgui_ctx, "CursorForDAWs_RightSidebarDock")
+                if ok_id and type(dock_id) == "number" then
+                    pcall(reaper.ImGui_SetNextWindowDockID, imgui_ctx, dock_id, cond_first)
+                end
+            end
+        end
 
         local visible, open = reaper.ImGui_Begin(imgui_ctx, WINDOW_TITLE, true)
         if visible then

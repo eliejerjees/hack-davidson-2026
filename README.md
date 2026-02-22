@@ -69,6 +69,13 @@ GEMINI_MODEL=gemini-2.5-flash
 
 Run `cursor_panel.lua`.
 
+Dock as sidebar:
+1. Run the panel once.
+2. Drag the `Cursor for DAWs` tab/title bar into REAPER's right docker area.
+3. Release when REAPER shows the right-dock drop highlight.
+
+After docking once, REAPER will remember the layout on future runs. If needed, save/restore with REAPER screensets.
+
 Panel features:
 - Dockable window titled **Cursor for DAWs**
 - Live status row (selected clips, selected tracks, time selection, cursor)
