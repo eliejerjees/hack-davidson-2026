@@ -1,0 +1,88 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ─── Base resets ─────────────────────────────────────────── */
+* {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+/* ─── DAW scrollbar ───────────────────────────────────────── */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #111214;
+}
+::-webkit-scrollbar-thumb {
+  background: #2a2c32;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #3d4048;
+}
+
+/* ─── Meter bar animations ────────────────────────────────── */
+@keyframes meterRise {
+  0%   { height: 20%; }
+  25%  { height: 75%; }
+  50%  { height: 55%; }
+  75%  { height: 90%; }
+  100% { height: 35%; }
+}
+
+@keyframes meterRise2 {
+  0%   { height: 60%; }
+  30%  { height: 30%; }
+  60%  { height: 85%; }
+  80%  { height: 45%; }
+  100% { height: 65%; }
+}
+
+@keyframes meterRise3 {
+  0%   { height: 40%; }
+  40%  { height: 95%; }
+  55%  { height: 60%; }
+  80%  { height: 30%; }
+  100% { height: 50%; }
+}
+
+@keyframes waveform {
+  0%   { d: path("M0 50 Q20 20 40 50 Q60 80 80 50 Q100 20 120 50 Q140 80 160 50 Q180 20 200 50"); }
+  50%  { d: path("M0 50 Q20 70 40 50 Q60 30 80 50 Q100 70 120 50 Q140 30 160 50 Q180 70 200 50"); }
+  100% { d: path("M0 50 Q20 20 40 50 Q60 80 80 50 Q100 20 120 50 Q140 80 160 50 Q180 20 200 50"); }
+}
+
+.meter-bar-1 { animation: meterRise 1.8s ease-in-out infinite; }
+.meter-bar-2 { animation: meterRise2 2.2s ease-in-out infinite; }
+.meter-bar-3 { animation: meterRise3 1.5s ease-in-out infinite; }
+.meter-bar-4 { animation: meterRise 2.8s ease-in-out infinite; }
+.meter-bar-5 { animation: meterRise2 1.9s ease-in-out infinite; }
+.meter-bar-6 { animation: meterRise3 2.4s ease-in-out infinite; }
+
+/* ─── Panel glow utility ──────────────────────────────────── */
+.panel-glow:hover {
+  box-shadow: 0 0 0 1px #3d4048, 0 0 16px 0 rgba(56, 189, 248, 0.06);
+}
+
+.btn-glow:hover {
+  box-shadow: 0 0 12px 0 rgba(56, 189, 248, 0.25);
+}
+
+.btn-blue-glow:hover {
+  box-shadow: 0 0 12px 0 rgba(96, 165, 250, 0.25);
+}
+
+/* ─── Transport button states ─────────────────────────────── */
+.transport-btn {
+  transition: color 0.15s ease, background 0.15s ease;
+}
+.transport-btn:hover {
+  color: #38bdf8;
+  background: rgba(56, 189, 248, 0.08);
+}
