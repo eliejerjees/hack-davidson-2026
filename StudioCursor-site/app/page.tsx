@@ -12,13 +12,10 @@ const SITE = {
   description:
     "StudioCursor is an AI-powered editing assistant built directly inside REAPER. Type or speak commands like \"fade out 2s\" or \"crossfade these clips\", and the system safely converts them into validated DAW actions. Multi-step commands work, and every run executes inside a single Undo block for safety.",
   links: {
-    github: "#",   // replace with real URL
-    devpost: "#",  // replace with real URL
+    github: "https://github.com/eliejerjees/StudioCursor",
+    devpost: "https://devpost.com/software/studiocursor?_gl=1*12azt62*_gcl_au*MTIwNDUxMTczNS4xNzcwNzk1ODIz*_ga*OTQ4MTEzODE0LjE3NzA3OTU4MjQ.*_ga_0YHJK3Y10M*czE3NzE4MzAxODQkbzgkZzEkdDE3NzE4MzAyNTQkajU5JGwwJGgw",
   },
   video: {
-    // Use one of:
-    //   youtubeId: "dQw4w9WgXcQ"   → YouTube embed
-    //   src: "/demo.mp4"           → local file
     youtubeId: "Lkqhr0Jfu08",
     src: "/demo.mp4",
   },
